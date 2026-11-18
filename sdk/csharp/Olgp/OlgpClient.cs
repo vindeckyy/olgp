@@ -52,6 +52,7 @@ public sealed class OlgpClient
         KnowledgeBases = new KnowledgeBaseRoutes(this);
         Images = new ImageRoutes(this);
         AudioRecordings = new RecordingRoutes(this);
+        Audio = new AudioRoutes(this);
         Engine = new EngineRoutes(this);
     }
 
@@ -63,6 +64,7 @@ public sealed class OlgpClient
     public KnowledgeBaseRoutes KnowledgeBases { get; }
     public ImageRoutes Images { get; }
     public RecordingRoutes AudioRecordings { get; }
+    public AudioRoutes Audio { get; }
     public EngineRoutes Engine { get; }
 
     public async Task<string> ChatAsync(string model, IEnumerable<ChatMessage> messages)
@@ -538,6 +540,45 @@ public sealed class OlgpClient
             client.SendAsync(
                 HttpMethod.Post,
                 $"/v1/audio/recordings/{Uri.EscapeDataString(recordingId)}:reprocess"
+            );
+    }
+
+    public sealed class AudioRoutes(OlgpClient client)
+    {
+        public RecordingCaptureRoutes Recordings { get; } = new(client);
+    }
+
+    public sealed class RecordingCaptureRoutes(OlgpClient client)
+    {
+        public Task<JsonElement> StartAsync(object? input = null) =>
+            client.SendAsync(
+                HttpMethod.Post,
+                "/v1/audio/recordings",
+                input ?? new { retainAudio = false }
+            );
+
+        public Task<JsonElement> AppendAsync(string recordingId, uint seq, string pcm) =>
+            client.SendAsync(
+                HttpMethod.Post,
+                $"/v1/audio/recordings/{Uri.EscapeDataString(recordingId)}/audio",
+                new { seq, pcm }
+            );
+
+        public async Task<JsonElement> AppendResumableAsync(string recordingId, string pcm)
+        {
+            var recording = await ResumeAsync(recordingId).ConfigureAwait(false);
+            var seq = recording.ValueKind == JsonValueKind.Object
+                && recording.TryGetProperty("chunk_count", out var count)
+                && count.TryGetUInt32(out var next)
+                    ? next
+                    : 0u;
+            return await AppendAsync(recordingId, seq, pcm).ConfigureAwait(false);
+        }
+
+        public Task<JsonElement> ResumeAsync(string recordingId) =>
+            client.SendAsync(
+                HttpMethod.Get,
+                $"/v1/audio/recordings/{Uri.EscapeDataString(recordingId)}"
             );
     }
 }

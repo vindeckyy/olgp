@@ -20,6 +20,59 @@ type DocumentsApi = {
   image(knowledgeBaseId: string, payload: Json): Promise<unknown>;
 };
 
+export type RecordingPcm = string | Uint8Array | ArrayBuffer | Json;
+
+export interface RecordingCapture {
+  id: string;
+  recording: Json;
+  append(pcm: RecordingPcm, seq?: number): Promise<unknown>;
+  appendResumable(pcm: RecordingPcm): Promise<unknown>;
+  finish(options?: Json): Promise<unknown>;
+  reprocess(options?: Json): Promise<unknown>;
+  retrieve(): Promise<unknown>;
+  delete(): Promise<unknown>;
+}
+
+function unwrapResult(body: unknown): Json {
+  if (body && typeof body === "object" && "result" in body) {
+    const result = body.result;
+    if (result && typeof result === "object") {
+      return result as Json;
+    }
+  }
+  if (body && typeof body === "object") {
+    return body as Json;
+  }
+  throw new Error("olgp: recording response is not an object");
+}
+
+function recordingFrom(body: unknown): { recording: Json; id: string; sequence: number } {
+  const recording = unwrapResult(body);
+  const id = recording.id;
+  if (typeof id !== "string") {
+    throw new Error("olgp: recording response has no id");
+  }
+  const count = recording.chunk_count ?? recording.chunkCount;
+  return { recording, id, sequence: typeof count === "number" ? count : 0 };
+}
+
+function pcmRequest(pcm: RecordingPcm, seq: number): Json {
+  if (pcm instanceof ArrayBuffer) {
+    return pcmRequest(new Uint8Array(pcm), seq);
+  }
+  if (pcm instanceof Uint8Array) {
+    let binary = "";
+    for (const byte of pcm) {
+      binary += String.fromCharCode(byte);
+    }
+    return { seq, pcm: btoa(binary) };
+  }
+  if (typeof pcm === "string") {
+    return { seq, pcm };
+  }
+  return { seq, ...pcm };
+}
+
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -154,6 +207,41 @@ export class OlgpClient {
     }
   }
 
+  private recordingCapture(body: unknown): RecordingCapture {
+    const initial = recordingFrom(body);
+    const id = initial.id;
+    let sequence = initial.sequence;
+    const capture: RecordingCapture = {
+      id,
+      recording: initial.recording,
+      append: async (pcm, seq = sequence) => {
+        const ack = await this.recordings.append(id, pcmRequest(pcm, seq));
+        sequence = seq + 1;
+        return ack;
+      },
+      appendResumable: async (pcm) => {
+        try {
+          return await capture.append(pcm);
+        } catch {
+          const resumed = recordingFrom(await this.recordings.get(id));
+          sequence = resumed.sequence;
+          capture.recording = resumed.recording;
+          return capture.append(pcm);
+        }
+      },
+      finish: async (options) => unwrapResult(await this.recordings.finish(id, options)),
+      reprocess: async (options) => unwrapResult(await this.recordings.reprocess(id, options)),
+      retrieve: async () => {
+        const current = recordingFrom(await this.recordings.get(id));
+        sequence = current.sequence;
+        capture.recording = current.recording;
+        return current.recording;
+      },
+      delete: () => this.recordings.delete(id),
+    };
+    return capture;
+  }
+
   readonly speakers = {
     list: () => this.request("GET", "/v1/speakers"),
     retrieve: (speakerId: string) => this.request("GET", `/v1/speakers/${encodeURIComponent(speakerId)}`),
@@ -280,8 +368,15 @@ export class OlgpClient {
       this.request("POST", `/v1/audio/recordings/${encodeURIComponent(recordingId)}:finish`, payload),
     reprocess: (recordingId: string, payload?: Json) =>
       this.request("POST", `/v1/audio/recordings/${encodeURIComponent(recordingId)}:reprocess`, payload),
+    start: async (input?: Json) =>
+      this.recordingCapture(await this.request("POST", "/v1/audio/recordings", input ?? {})),
+    resume: async (recordingId: string) =>
+      this.recordingCapture(
+        await this.request("GET", `/v1/audio/recordings/${encodeURIComponent(recordingId)}`),
+      ),
   };
   readonly audioRecordings = this.recordings;
+  readonly audio = { recordings: this.recordings };
 
   async chat(model: string, messages: ChatMessage[]): Promise<string> {
     const body = await this.request<{ choices: { message: { content: string } }[] }>(

@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import quote
 
 __all__ = [
+    "audio",
     "BoxInfo",
     "Client",
     "connect",
@@ -266,6 +267,46 @@ class Client:
             return self.Jobs(self._client)
 
     class Recordings(_Module):
+        class Capture(_Module):
+            def __init__(self, client: "Client") -> None:
+                super().__init__(client)
+                self._seq: dict[str, int] = {}
+
+            def start(self, input: dict[str, Any] | None = None, **fields: Any) -> Any:
+                payload = dict(input or {})
+                payload.update(fields)
+                if "retain_audio" in payload:
+                    payload["retainAudio"] = payload.pop("retain_audio")
+                return self._client._request("POST", "/v1/audio/recordings", payload)
+
+            def append(self, recording_id: str, pcm: str) -> Any:
+                seq = self._seq.get(recording_id, 0)
+                self._seq[recording_id] = seq + 1
+                return self._client._request(
+                    "POST",
+                    f"/v1/audio/recordings/{self._id(recording_id)}/audio",
+                    {"seq": seq, "pcm": pcm},
+                )
+
+            def append_resumable(self, recording_id: str, pcm: str) -> Any:
+                return self.append(recording_id, pcm)
+
+            def resume(self, recording_id: str) -> Any:
+                recording = self._client._request(
+                    "GET", f"/v1/audio/recordings/{self._id(recording_id)}"
+                )
+                if isinstance(recording, dict) and "chunk_count" in recording:
+                    self._seq[recording_id] = int(recording["chunk_count"])
+                return recording
+
+        def __init__(self, client: "Client") -> None:
+            super().__init__(client)
+            self._capture = self.Capture(client)
+
+        @property
+        def capture(self) -> "Client.Recordings.Capture":
+            return self._capture
+
         def create(self, retain_audio: bool = False) -> Any:
             return self._client._request(
                 "POST", "/v1/audio/recordings", {"retainAudio": retain_audio}
@@ -314,6 +355,7 @@ class Client:
         self.memory_token = memory_token or os.environ.get("OLGP_MEMORY_TOKEN", "")
         self.search_provider = search_provider or os.environ.get("OLGP_SEARCH_PROVIDER", "")
         self.tavily_key = tavily_key or os.environ.get("TAVILY_API_KEY", "")
+        self._recordings = None
 
     def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None
@@ -388,7 +430,13 @@ class Client:
 
     @property
     def recordings(self) -> "Client.Recordings":
-        return self.Recordings(self)
+        if self._recordings is None:
+            self._recordings = self.Recordings(self)
+        return self._recordings
+
+    @property
+    def audio(self) -> "_Audio":
+        return _Audio(self.recordings)
 
     def chat(self, model: str, message: str | list[dict[str, Any]]) -> str:
         """Send one chat completion request and return the reply text."""
@@ -399,6 +447,11 @@ class Client:
             "/v1/chat/completions", {"model": model, "messages": messages}
         )
         return reply["choices"][0]["message"]["content"]
+
+
+class _Audio:
+    def __init__(self, recordings: "Client.Recordings") -> None:
+        self.recordings = recordings
 
 
 class _DefaultClient:
@@ -422,6 +475,7 @@ knowledge_bases = Client.KnowledgeBases(_DefaultClient())
 images = Client.Images(_DefaultClient())
 engine = Client.Engine(_DefaultClient())
 recordings = Client.Recordings(_DefaultClient())
+audio = _Audio(recordings)
 
 
 def connect(

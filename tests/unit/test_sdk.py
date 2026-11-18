@@ -200,5 +200,28 @@ class SdkTest(unittest.TestCase):
                 client.images.jobs.save("img-1", path)
             self.assertEqual(path.read_bytes(), payload)
 
+
+    def test_audio_capture_helpers_alias_and_resume(self) -> None:
+        client = olgp.Client("http://box:8787", "token")
+        start = {"accepted": True, "result": {"id": "rec-1", "chunk_count": 0}}
+        append = {"accepted": True, "result": {"accepted": True}}
+        resume = {"id": "rec-1", "chunk_count": 2}
+        responses = [
+            FakeResponse(json.dumps(payload).encode())
+            for payload in (start, append, append, resume, append)
+        ]
+        with mock.patch.object(
+            olgp.urllib.request, "urlopen", side_effect=responses
+        ) as open_mock:
+            created = client.audio.recordings.capture.start(retain_audio=True)
+            client.audio.recordings.capture.append("rec-1", "AA")
+            client.audio.recordings.capture.append_resumable("rec-1", "BB")
+            client.audio.recordings.capture.resume("rec-1")
+            client.audio.recordings.capture.append_resumable("rec-1", "CC")
+        self.assertEqual(created["result"]["id"], "rec-1")
+        body = json.loads(open_mock.call_args_list[-1].args[0].data)
+        self.assertEqual(body["seq"], 2)
+        self.assertTrue(hasattr(client.audio, "recordings"))
+
 if __name__ == "__main__":
     unittest.main()

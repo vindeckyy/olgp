@@ -31,6 +31,7 @@ Sources: `https://wici.ai/wici-one`, `https://wici.ai/technology`,
 | CLI probes | `wici-smi --workload`, `wici runtime check` | `olgp-smi --workload` and `olgpctl runtime check` | implemented |
 | Image results | Verified bytes, `result.save()`, content type | `result_bytes` / `ResultBytesAsync` / typed bytes across SDKs | implemented |
 | Search headers | Caller-owned Tavily provider/key headers | All SDKs support optional `X-Wici-Search-*` headers | implemented |
+| Audio capture | `audio.recordings` capture/resume helpers | All SDKs expose start/append/resume aliases over the 7 recording routes | implemented |
 | Hardware SKU | RTX 5060 Ti/5090, Wi-Fi 7, NVMe, enclosure, PSU, cooling | Not reproducible in a protocol repo | structural |
 | Driver platforms | macOS, Windows, Vulkan ICD, D3D, games/CAD/video apps | Not implemented; no misleading stub ICD | structural/gap |
 | Benchmarks | Product tok/s, FPS, export, encode, latency tables | No equivalent hardware claims; benchmark harness reports local results | structural |

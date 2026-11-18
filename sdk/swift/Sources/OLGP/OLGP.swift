@@ -481,6 +481,49 @@ public final class Client {
         try await object("POST", "/v1/audio/recordings/\(recordingId):reprocess")
     }
 
+    // MARK: - Recording capture handles
+
+    public func audioRecordingCaptureStart(
+        name: String? = nil,
+        language: String? = nil,
+        retainAudio: Bool = false,
+        audio: [String: Any]? = nil
+    ) async throws -> [String: Any] {
+        var body: [String: Any] = ["retainAudio": retainAudio]
+        if let name = name { body["name"] = name }
+        if let language = language { body["language"] = language }
+        if let audio = audio { body["audio"] = audio }
+        let response = try await object("POST", "/v1/audio/recordings", body: body)
+        return response["result"] as? [String: Any] ?? response
+    }
+
+    public func audioRecordingCaptureAppend(
+        _ recordingId: String,
+        seq: Int,
+        pcm: String
+    ) async throws -> [String: Any] {
+        let response = try await object(
+            "POST",
+            "/v1/audio/recordings/\(recordingId)/audio",
+            body: ["seq": seq, "pcm": pcm]
+        )
+        return response["result"] as? [String: Any] ?? response
+    }
+
+    public func audioRecordingCaptureAppendResumable(
+        _ recordingId: String,
+        pcm: String
+    ) async throws -> [String: Any] {
+        // shortcut: seq comes from accepted chunk_count; retrying an acked chunk duplicates it.
+        let recording = try await audioRecordingsGet(recordingId)
+        let seq = recording["chunk_count"] as? Int ?? 0
+        return try await audioRecordingCaptureAppend(recordingId, seq: seq, pcm: pcm)
+    }
+
+    public func audioRecordingCaptureResume(_ recordingId: String) async throws -> [String: Any] {
+        try await audioRecordingsGet(recordingId)
+    }
+
 }
 
 public func connect(

@@ -396,6 +396,10 @@ pub struct Client {
     pub memos: Memos,
     pub knowledge_bases: KnowledgeBases,
     pub images: Images,
+    /// Durable recording routes.
+    pub recordings: Recordings,
+    /// Product-style `audio` namespace; both names share one service.
+    pub audio: Audio,
 }
 
 impl Client {
@@ -451,7 +455,21 @@ impl Client {
                 inner: inner.clone(),
             },
             images: Images {
-                jobs: ImageJobs { inner },
+                jobs: ImageJobs { inner: inner.clone() },
+            },
+            recordings: Recordings {
+                inner: inner.clone(),
+                capture: Capture {
+                    inner: inner.clone(),
+                },
+            },
+            audio: Audio {
+                recordings: Recordings {
+                    inner: inner.clone(),
+                    capture: Capture {
+                        inner: inner.clone(),
+                    },
+                },
             },
         })
     }
@@ -929,6 +947,201 @@ impl ImageJobs {
     }
 }
 
+/// Product-style `audio` namespace.
+#[derive(Clone, Debug)]
+pub struct Audio {
+    pub recordings: Recordings,
+}
+
+/// Durable recording routes under `/v1/audio/recordings`.
+#[derive(Clone, Debug)]
+pub struct Recordings {
+    inner: Arc<Runtime>,
+    /// Capture-handle helpers matching `audio.recordings.start(...)`.
+    pub capture: Capture,
+}
+
+/// Capture helpers over the existing recording routes.
+#[derive(Clone, Debug)]
+pub struct Capture {
+    inner: Arc<Runtime>,
+}
+
+/// A handle bound to one recording id.
+#[derive(Clone, Debug)]
+pub struct RecordingCapture {
+    pub id: String,
+    /// Metadata returned by create or resume.
+    pub recording: Value,
+    inner: Arc<Runtime>,
+}
+
+fn recording_path(id: &str, suffix: &str) -> String {
+    format!("/v1/audio/recordings/{}{}", path_segment(id), suffix)
+}
+
+fn recording_seq(recording: &Value) -> Result<u32, String> {
+    recording
+        .get("chunk_count")
+        .and_then(Value::as_u64)
+        .map(|count| count as u32)
+        .ok_or_else(|| "olgp: recording chunk_count missing".into())
+}
+
+fn append_chunk(inner: &Arc<Runtime>, id: &str, seq: u32, pcm: &str) -> Result<Value, String> {
+    inner.json(
+        "POST",
+        &recording_path(id, "/audio"),
+        Some(&json!({"seq": seq, "pcm": pcm})),
+    )
+}
+
+fn capture_from(
+    inner: Arc<Runtime>,
+    response: &Value,
+    id_hint: Option<&str>,
+) -> Result<RecordingCapture, String> {
+    let recording = response.get("result").unwrap_or(response);
+    let id = id_hint
+        .map(str::to_owned)
+        .or_else(|| {
+            recording
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "olgp: recording id missing".to_owned())?;
+    Ok(RecordingCapture {
+        id,
+        recording: recording.clone(),
+        inner,
+    })
+}
+
+impl Recordings {
+    pub fn create(&self, retain_audio: bool) -> Result<Value, String> {
+        self.inner.json(
+            "POST",
+            "/v1/audio/recordings",
+            Some(&json!({"retainAudio": retain_audio})),
+        )
+    }
+
+    pub fn list(&self) -> Result<Value, String> {
+        self.inner.json("GET", "/v1/audio/recordings", None)
+    }
+
+    pub fn get(&self, recording_id: &str) -> Result<Value, String> {
+        self.inner
+            .json("GET", &recording_path(recording_id, ""), None)
+    }
+
+    pub fn delete(&self, recording_id: &str) -> Result<Value, String> {
+        self.inner
+            .json("DELETE", &recording_path(recording_id, ""), None)
+    }
+
+    pub fn append(&self, recording_id: &str, seq: u32, pcm: &str) -> Result<Value, String> {
+        append_chunk(&self.inner, recording_id, seq, pcm)
+    }
+
+    pub fn finish(&self, recording_id: &str) -> Result<Value, String> {
+        self.inner
+            .json("POST", &recording_path(recording_id, ":finish"), None)
+    }
+
+    pub fn reprocess(&self, recording_id: &str) -> Result<Value, String> {
+        self.inner
+            .json("POST", &recording_path(recording_id, ":reprocess"), None)
+    }
+
+    /// Start a capture through the nested `capture` facade.
+    pub fn start<T: Serialize>(&self, input: T) -> Result<RecordingCapture, String> {
+        self.capture.start(input)
+    }
+
+    pub fn append_resumable(&self, recording_id: &str, pcm: &str) -> Result<Value, String> {
+        self.capture.append_resumable(recording_id, pcm)
+    }
+
+    pub fn resume(&self, recording_id: &str) -> Result<RecordingCapture, String> {
+        self.capture.resume(recording_id)
+    }
+}
+
+impl Capture {
+    /// `input` is the create payload (for example `{"retainAudio": true}`).
+    pub fn start<T: Serialize>(&self, input: T) -> Result<RecordingCapture, String> {
+        let body =
+            serde_json::to_value(input).map_err(|error| format!("recording input: {error}"))?;
+        let response = self.inner.json("POST", "/v1/audio/recordings", Some(&body))?;
+        capture_from(self.inner.clone(), &response, None)
+    }
+
+    /// Append after reading the server's last accepted chunk number.
+    pub fn append(&self, recording_id: &str, pcm: &str) -> Result<Value, String> {
+        let recording = self
+            .inner
+            .json("GET", &recording_path(recording_id, ""), None)?;
+        append_chunk(
+            &self.inner,
+            recording_id,
+            recording_seq(&recording)?,
+            pcm,
+        )
+    }
+
+    /// Retry from the last accepted chunk when an upload is interrupted.
+    pub fn append_resumable(&self, recording_id: &str, pcm: &str) -> Result<Value, String> {
+        if let Ok(accepted) = self.append(recording_id, pcm) {
+            return Ok(accepted);
+        }
+        let recording = self
+            .inner
+            .json("GET", &recording_path(recording_id, ""), None)?;
+        append_chunk(
+            &self.inner,
+            recording_id,
+            recording_seq(&recording)?,
+            pcm,
+        )
+    }
+
+    /// Reattach to an existing recording and continue from its last chunk.
+    pub fn resume(&self, recording_id: &str) -> Result<RecordingCapture, String> {
+        let recording = self
+            .inner
+            .json("GET", &recording_path(recording_id, ""), None)?;
+        capture_from(self.inner.clone(), &recording, Some(recording_id))
+    }
+}
+
+impl RecordingCapture {
+    pub fn append(&self, pcm: &str) -> Result<Value, String> {
+        self.capture().append(&self.id, pcm)
+    }
+
+    pub fn append_resumable(&self, pcm: &str) -> Result<Value, String> {
+        self.capture().append_resumable(&self.id, pcm)
+    }
+
+    pub fn finish(&self) -> Result<Value, String> {
+        self.inner
+            .json("POST", &recording_path(&self.id, ":finish"), None)
+    }
+
+    pub fn reprocess(&self) -> Result<Value, String> {
+        self.inner
+            .json("POST", &recording_path(&self.id, ":reprocess"), None)
+    }
+
+    fn capture(&self) -> Capture {
+        Capture {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1234,6 +1447,118 @@ mod tests {
                 task: "summarize".into(),
                 state: "ready".into(),
             }
+        );
+        server.join().unwrap();
+    }
+
+    fn serve<F>(exchanges: F) -> (u16, thread::JoinHandle<()>)
+    where
+        F: FnOnce(&str) -> Vec<(String, String)> + Send + 'static,
+    {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let authority = format!("127.0.0.1:{port}");
+        let server = thread::spawn(move || {
+            for (expected, response) in exchanges(&authority) {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = vec![0; expected.len()];
+                stream.read_exact(&mut request).unwrap();
+                assert_eq!(String::from_utf8(request).unwrap(), expected);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (port, server)
+    }
+
+    fn reply(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn failure(body: &str) -> String {
+        format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn capture_start_appends_from_server_sequence() {
+        let (port, server) = serve(|authority| {
+            vec![
+                (
+                    build_request(
+                        "POST",
+                        authority,
+                        "/v1/audio/recordings",
+                        "tok",
+                        Some(&json!({"name": "review", "retainAudio": true}).to_string()),
+                    ),
+                    reply(r#"{"accepted":true,"result":{"id":"rec-1","chunk_count":0}}"#),
+                ),
+                (
+                    build_request("GET", authority, "/v1/audio/recordings/rec-1", "tok", None),
+                    reply(r#"{"id":"rec-1","chunk_count":2}"#),
+                ),
+                (
+                    build_request(
+                        "POST",
+                        authority,
+                        "/v1/audio/recordings/rec-1/audio",
+                        "tok",
+                        Some(&json!({"seq": 2, "pcm": "AA=="}).to_string()),
+                    ),
+                    reply(r#"{"accepted":true}"#),
+                ),
+            ]
+        });
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "tok").unwrap();
+        let capture = client
+            .audio
+            .recordings
+            .start(json!({"name": "review", "retainAudio": true}))
+            .unwrap();
+        assert_eq!(capture.id, "rec-1");
+        assert_eq!(
+            capture.append("AA==").unwrap()["accepted"].as_bool(),
+            Some(true)
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn capture_resume_retries_from_last_accepted_chunk() {
+        let (port, server) = serve(|authority| {
+            let get = || {
+                build_request("GET", authority, "/v1/audio/recordings/rec-1", "tok", None)
+            };
+            let append = |seq: u32| {
+                build_request(
+                    "POST",
+                    authority,
+                    "/v1/audio/recordings/rec-1/audio",
+                    "tok",
+                    Some(&json!({"seq": seq, "pcm": "AA=="}).to_string()),
+                )
+            };
+            vec![
+                (get(), reply(r#"{"id":"rec-1","chunk_count":1}"#)),
+                (get(), reply(r#"{"id":"rec-1","chunk_count":1}"#)),
+                (append(1), failure(r#"{"error":{"code":"network"}}"#)),
+                (get(), reply(r#"{"id":"rec-1","chunk_count":2}"#)),
+                (append(2), reply(r#"{"accepted":true}"#)),
+            ]
+        });
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "tok").unwrap();
+        let capture = client.recordings.capture.resume("rec-1").unwrap();
+        assert_eq!(capture.recording["chunk_count"], 1);
+        assert_eq!(
+            capture.append_resumable("AA==").unwrap()["accepted"].as_bool(),
+            Some(true)
         );
         server.join().unwrap();
     }
