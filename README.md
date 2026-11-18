@@ -47,6 +47,11 @@ scripts/check-coverage.sh
 scripts/run-all.sh
 ```
 
+On Ubuntu/Debian, the C++ semantic tests need `libnghttp2-dev` and
+`libssl-dev`; the coverage gate needs `cargo-llvm-cov`, the Rust
+`llvm-tools-preview` component, and Python `blake3` and `coverage`.
+
+
 `scripts/check-coverage.sh` enforces a 95% line-coverage gate. It measures the
 deterministic first-party Rust logic and all first-party Python modules.
 Network runtime glue, executable entrypoints, generated code, and vendored
