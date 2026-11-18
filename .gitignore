@@ -10,4 +10,6 @@
 coverage.xml
 artifacts/e2e/*.wav
 .DS_Store
+__pycache__/
+*.pyc
 third_party/*/.git/
