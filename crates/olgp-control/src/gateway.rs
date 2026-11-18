@@ -193,44 +193,51 @@ fn query_param(raw_path: &str, key: &str) -> Option<String> {
 }
 
 async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
+    let mut peek = [0u8; 8192];
+    let peeked = socket.peek(&mut peek).await.unwrap_or(0);
+    let preview = String::from_utf8_lossy(&peek[..peeked]).into_owned();
+    if let Some(end) = preview.find("\r\n\r\n") {
+        let head = &preview[..end + 4];
+        let first = head.lines().next().unwrap_or("");
+        let mut parts = first.split_whitespace();
+        let _method = parts.next().unwrap_or("");
+        let raw_path = parts.next().unwrap_or("").to_owned();
+        let path = raw_path.split('?').next().unwrap_or("").to_owned();
+        let is_upgrade = head
+            .lines()
+            .any(|line| line.to_ascii_lowercase().contains("upgrade: websocket"));
+        let is_realtime = path == "/v1/realtime";
+        let is_speaker = path.starts_with("/v1/speakers/") && path.ends_with("/audio:stream");
+        if is_upgrade && (is_realtime || is_speaker) {
+            let authorized_ws = authorized(head, &state.trusted.lock().unwrap())
+                || query_param(&raw_path, "token")
+                    .is_some_and(|token| state.trusted.lock().unwrap().is_valid(&token));
+            if !authorized_ws {
+                let _ = socket
+                    .write_all(&error("unauthorized", "Device Token required", "401 Unauthorized", false))
+                    .await;
+                return;
+            }
+            if is_realtime {
+                let mode = if raw_path.contains("mode=voice") {
+                    crate::voice::VoiceMode::Voice
+                } else {
+                    crate::voice::VoiceMode::Chat
+                };
+                tokio::spawn(crate::voice::serve(socket, mode));
+            } else {
+                tokio::spawn(crate::voice::serve_speaker_audio(socket));
+            }
+            return;
+        }
+    }
+
     let Some((head, body, first)) = read_request(&mut socket).await else {
         return;
     };
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("").to_owned();
-    let raw_path = parts.next().unwrap_or("");
-    let path = raw_path.split('?').next().unwrap_or("").to_owned();
-    let mode = if raw_path.contains("mode=voice") {
-        crate::voice::VoiceMode::Voice
-    } else {
-        crate::voice::VoiceMode::Chat
-    };
-    let websocket_authorized = || {
-        authorized(&head, &state.trusted.lock().unwrap())
-            || query_param(raw_path, "token")
-                .is_some_and(|token| state.trusted.lock().unwrap().is_valid(&token))
-    };
-    if path == "/v1/realtime"
-        && head.lines().any(|line| line.to_ascii_lowercase().contains("upgrade: websocket"))
-    {
-        if !websocket_authorized() {
-            let _ = socket.write_all(&error("unauthorized", "Device Token required", "401 Unauthorized", false)).await;
-            return;
-        }
-        tokio::spawn(crate::voice::serve(socket, mode));
-        return;
-    }
-    if path.starts_with("/v1/speakers/")
-        && path.ends_with("/audio:stream")
-        && head.lines().any(|line| line.to_ascii_lowercase().contains("upgrade: websocket"))
-    {
-        if !websocket_authorized() {
-            let _ = socket.write_all(&error("unauthorized", "Device Token required", "401 Unauthorized", false)).await;
-            return;
-        }
-        tokio::spawn(crate::voice::serve_speaker_audio(socket));
-        return;
-    }
+    let path = parts.next().unwrap_or("").split('?').next().unwrap_or("").to_owned();
     let result = handle_request(&method, &path, &head, &body, &state).await;
     let _ = socket.write_all(&result).await;
 }
