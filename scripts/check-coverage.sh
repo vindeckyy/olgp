@@ -7,9 +7,15 @@ mkdir -p target
 THRESHOLD=95
 PYTHON="${PYTHON:-python3}"
 
-cargo llvm-cov --workspace --lib --lcov \
+COV_LOG=$(mktemp)
+if ! cargo llvm-cov --workspace --lib --lcov \
   --output-path target/lcov-control.info \
-  --ignore-filename-regex 'third_party|/usr/|rustc/' >/dev/null
+  --ignore-filename-regex 'third_party|/usr/|rustc/' >"$COV_LOG" 2>&1; then
+  cat "$COV_LOG"
+  rm -f "$COV_LOG"
+  exit 1
+fi
+rm -f "$COV_LOG"
 
 PYTHON_THRESHOLD="$THRESHOLD" "$PYTHON" - <<'PY'
 import os
