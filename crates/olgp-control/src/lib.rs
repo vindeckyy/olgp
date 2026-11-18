@@ -1,6 +1,7 @@
 //! Open Local GPU Protocol control plane.
 
 pub mod api;
+pub mod auth;
 pub mod bench;
 pub mod config;
 pub mod discovery;

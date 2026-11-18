@@ -5,6 +5,7 @@ members = [
     "crates/olgp-node",
     "crates/olgp-cli",
     "crates/olgp-driver",
+    "crates/olgp-sdk",
 ]
 
 [workspace.package]

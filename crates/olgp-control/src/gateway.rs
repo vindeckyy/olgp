@@ -15,11 +15,15 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
+use crate::auth::TrustedClients;
 use crate::config::Config;
 use tokio::io::copy_bidirectional;
 use crate::discovery::BoxInfo;
 use crate::product::ProductState;
 use crate::pairing::HostPairing;
+use crate::registry::ModelRegistry;
+use crate::sched::Scheduler;
+use crate::telemetry;
 
 struct GatewayState {
     info: BoxInfo,
@@ -30,6 +34,9 @@ struct GatewayState {
     pairing_code: PairingCode,
     engine_port: u16,
     product: Option<ProductState>,
+    trusted: Mutex<TrustedClients>,
+    scheduler: Mutex<Scheduler>,
+    registry: Mutex<ModelRegistry>,
 }
 fn response(status: &str, body: &str) -> Vec<u8> {
     format!(
@@ -108,11 +115,16 @@ async fn read_request(socket: &mut TcpStream) -> Option<(String, String, String)
     Some((head, body, first))
 }
 
-fn authorized(head: &str) -> bool {
-    head.lines().any(|line| {
-        line.to_ascii_lowercase().starts_with("authorization: bearer ")
-            && line.len() > "authorization: bearer ".len()
-    })
+fn authorized(head: &str, trusted: &TrustedClients) -> bool {
+    let Some(token) = head.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower
+            .strip_prefix("authorization: bearer ")
+            .map(|_| line["authorization: bearer ".len()..].trim())
+    }) else {
+        return false;
+    };
+    trusted.is_valid(token)
 }
 
 async fn proxy_engine(port: u16, head: &str, body: &str) -> Option<Vec<u8>> {
@@ -166,6 +178,17 @@ async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
     let _ = socket.write_all(&result).await;
 }
 
+fn sync_runtime_metrics(state: &GatewayState) {
+    let scheduler = state.scheduler.lock().unwrap();
+    telemetry::set("vram_bytes", scheduler.counters.vram_bytes);
+    telemetry::set("ram_bytes", scheduler.counters.ram_bytes);
+    telemetry::set("kv_ssd_writes", scheduler.counters.kv_ssd_writes);
+    drop(scheduler);
+    let registry = state.registry.lock().unwrap();
+    telemetry::set("shared_weight_bytes", registry.resident_bytes());
+    telemetry::set("kv_sessions", registry.tenant_count());
+}
+
 async fn handle_request(
     method: &str,
     path: &str,
@@ -194,13 +217,24 @@ async fn handle_request(
                     "recordings": true,
                     "images": true,
                 },
+                "scheduler": {
+                    "vram_bytes": state.scheduler.lock().unwrap().counters.vram_bytes,
+                    "sessions": state.scheduler.lock().unwrap().session_count(),
+                },
+                "sharing": {
+                    "shared_weight_bytes": state.registry.lock().unwrap().resident_bytes(),
+                    "kv_sessions": state.registry.lock().unwrap().tenant_count(),
+                },
                 "search": {"policy": "caller-key"},
                 "memory": {"policy": "opt-in"},
                 "ready": true,
             })
             .to_string(),
         ),
-        ("GET", "/metrics") => text_response("200 OK", &crate::telemetry::render()),
+        ("GET", "/metrics") => {
+            sync_runtime_metrics(state);
+            text_response("200 OK", &telemetry::render())
+        }
         ("GET", "/v1/pairing/status") => {
             let window = state.pairing_window.lock().unwrap();
             let open = window.map_or(false, |deadline| std::time::Instant::now() < deadline);
@@ -217,7 +251,7 @@ async fn handle_request(
             )
         }
         ("POST", "/v1/pairing") => pairing_request(state, body),
-        (_, _) if !authorized(head) => {
+        (_, _) if !authorized(head, &state.trusted.lock().unwrap()) => {
             error("unauthorized", "Device Token required", "401 Unauthorized", false)
         }
         ("POST", "/v1/chat/completions")
@@ -247,7 +281,7 @@ async fn handle_request(
             ),
         },
         ("POST", "/v1/pairing:open") => {
-            if !authorized(head) {
+            if !authorized(head, &state.trusted.lock().unwrap()) {
                 error("unauthorized", "Device Token required", "401 Unauthorized", false)
             } else {
                 *state.pairing_window.lock().unwrap() =
@@ -257,7 +291,7 @@ async fn handle_request(
             }
         }
         ("POST", "/v1/pairing:close") => {
-            if !authorized(head) {
+            if !authorized(head, &state.trusted.lock().unwrap()) {
                 error("unauthorized", "Device Token required", "401 Unauthorized", false)
             } else {
                 *state.pairing_window.lock().unwrap() = None;
@@ -350,6 +384,9 @@ fn pairing_request(state: &GatewayState, body: &str) -> Vec<u8> {
             match pairing.finish(&key, &pake, &proof, &state.info) {
                 Ok((confirmations, credential)) => {
                     *guard = None;
+                    if let Err(message) = state.trusted.lock().unwrap().add(&credential) {
+                        return error("internal_error", &message.to_string(), "500 Internal Server Error", false);
+                    }
                     response(
                         "200 OK",
                         &json!({
@@ -420,7 +457,20 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         .map_err(|e| format!("pairing code write: {e}"))?;
     std::fs::set_permissions(&code_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("pairing code mode: {e}"))?;
+    let trusted_path = std::path::PathBuf::from(
+        std::env::var("OLGP_TRUSTED_CLIENTS_PATH")
+            .unwrap_or_else(|_| "/var/lib/olgp/trusted_clients.json".into()),
+    );
+    let trusted = Mutex::new(TrustedClients::load(&trusted_path)?);
     let product = Some(ProductState::load()?);
+    let mib = 1024 * 1024u64;
+    let scheduler = Mutex::new(Scheduler::new(
+        u64::from(info.vram_mib) * mib,
+        16 * 1024 * mib,
+        u64::from(config.vram_reserve_mib) * mib,
+        config.max_interactive_sessions,
+    ));
+    let registry = Mutex::new(ModelRegistry::default());
     let state = Arc::new(GatewayState {
         info,
         identity: DeviceIdentity::generate().map_err(|e| e.to_string())?,
@@ -430,6 +480,9 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         pairing_code,
         engine_port: config.engine_port,
         product,
+        trusted,
+        scheduler,
+        registry,
     });
     let upstream = SocketAddr::from(([127, 0, 0, 1], 14833));
 
@@ -484,6 +537,17 @@ mod tests {
             pairing_code: PairingCode::new(123456),
             engine_port: 18080,
             product: None,
+            trusted: Mutex::new(
+                TrustedClients::load(&std::path::PathBuf::from("/tmp/olgp-gateway-trusted.json"))
+                    .unwrap(),
+            ),
+            scheduler: Mutex::new(Scheduler::new(
+                4096 * 1024 * 1024,
+                16 * 1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                1,
+            )),
+            registry: Mutex::new(ModelRegistry::default()),
         }
     }
 

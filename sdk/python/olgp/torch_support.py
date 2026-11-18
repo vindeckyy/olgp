@@ -22,10 +22,8 @@ class OlgpDevice:
         return self.name
 
     def generate(self, prompt: str) -> str:
-        return self.client.chat(
-            self.model,
-            [{"role": "user", "content": prompt}],
-        )
+        messages = [{"role": "user", "content": prompt}]
+        return self.client.chat(self.model, messages)
 
 
 def gpu(name: str = "olgp:0", model: str = "olgp-model", client: Client | None = None) -> OlgpDevice:

@@ -70,6 +70,12 @@ impl ModelRegistry {
     pub fn resident_bytes(&self) -> u64 {
         self.models.values().map(|model| model.bytes).sum()
     }
+
+    /// Total number of private tenant KV bindings.
+    #[must_use]
+    pub fn tenant_count(&self) -> u64 {
+        self.tenant_kv.len() as u64
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +116,14 @@ mod tests {
     fn releasing_unknown_tenant_is_false() {
         let mut registry = ModelRegistry::default();
         assert!(!registry.release("missing", "a"));
+    }
+
+    #[test]
+    fn tenant_count_tracks_private_sessions() {
+        let mut registry = ModelRegistry::default();
+        assert_eq!(registry.tenant_count(), 0);
+        registry.retain("m", "a", "hash", 100);
+        registry.retain("m", "b", "hash", 100);
+        assert_eq!(registry.tenant_count(), 2);
     }
 }

@@ -22,6 +22,9 @@ path.write_text(
     "hostname = olgp-compat\n"
     "gpu = Test GPU\n"
 )
+pathlib.Path("$WORK/trusted_clients.json").write_text(
+    '[{"token":"compat-token","client_public":"00","paired_at":"2026-01-01T00:00:00Z"}]'
+)
 PY
 
 openssl req -x509 -newkey rsa:2048 -nodes \
@@ -42,6 +45,7 @@ OLGP_SPEAKER_PATH="$WORK/speakers.json" \
 OLGP_RAG_PATH="$WORK/rag.json" \
 OLGP_IMAGES_PATH="$WORK/images.json" \
 OLGP_RECORDINGS_ROOT="$WORK/recordings" \
+OLGP_TRUSTED_CLIENTS_PATH="$WORK/trusted_clients.json" \
 cargo run -q -p olgp-node >"$WORK/node.log" 2>&1 &
 node=$!
 trap 'kill $engine $node >/dev/null 2>&1 || true' EXIT

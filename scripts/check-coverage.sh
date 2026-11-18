@@ -18,6 +18,7 @@ import pathlib
 threshold = float(os.environ["PYTHON_THRESHOLD"])
 keep = {
     "crates/olgp-control/src/api.rs",
+    "crates/olgp-control/src/auth.rs",
     "crates/olgp-control/src/bench.rs",
     "crates/olgp-control/src/config.rs",
     "crates/olgp-control/src/pairing.rs",

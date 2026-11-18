@@ -16,6 +16,11 @@ struct Values {
     cache_hits: u64,
     cache_misses: u64,
     evictions: u64,
+    vram_bytes: u64,
+    ram_bytes: u64,
+    shared_weight_bytes: u64,
+    kv_sessions: u64,
+    kv_ssd_writes: u64,
 }
 static VALUES: LazyLock<Mutex<Values>> = LazyLock::new(|| Mutex::new(Values::default()));
 
@@ -38,12 +43,25 @@ pub fn increment(name: &str) {
     }
 }
 
+/// Set a runtime gauge.
+pub fn set(name: &str, value: u64) {
+    let mut guard = values().lock().unwrap();
+    match name {
+        "vram_bytes" => guard.vram_bytes = value,
+        "ram_bytes" => guard.ram_bytes = value,
+        "shared_weight_bytes" => guard.shared_weight_bytes = value,
+        "kv_sessions" => guard.kv_sessions = value,
+        "kv_ssd_writes" => guard.kv_ssd_writes = value,
+        _ => {}
+    }
+}
+
 /// Render counters in Prometheus text format.
 #[must_use]
 pub fn render() -> String {
     let guard = values().lock().unwrap();
     format!(
-        "olgp_blocking_calls {}\nolgp_bytes_wifi {}\nolgp_batch_hits {}\nolgp_batch_misses {}\nolgp_trace_aborts {}\nolgp_cache_hits {}\nolgp_cache_misses {}\nolgp_evictions {}\n",
+        "olgp_blocking_calls {}\nolgp_bytes_wifi {}\nolgp_batch_hits {}\nolgp_batch_misses {}\nolgp_trace_aborts {}\nolgp_cache_hits {}\nolgp_cache_misses {}\nolgp_evictions {}\nolgp_vram_bytes {}\nolgp_ram_bytes {}\nolgp_shared_weight_bytes {}\nolgp_kv_sessions {}\nolgp_kv_ssd_writes {}\n",
         guard.blocking_calls,
         guard.bytes_wifi,
         guard.batch_hits,
@@ -52,6 +70,11 @@ pub fn render() -> String {
         guard.cache_hits,
         guard.cache_misses,
         guard.evictions,
+        guard.vram_bytes,
+        guard.ram_bytes,
+        guard.shared_weight_bytes,
+        guard.kv_sessions,
+        guard.kv_ssd_writes,
     )
 }
 
@@ -124,5 +147,18 @@ mod tests {
         unsafe { std::env::remove_var("OLGP_TRACE_DIR"); }
         let text = std::fs::read_to_string(root.join("trace.jsonl")).unwrap();
         assert!(text.contains("\"name\":\"query\""));
+    }
+
+    #[test]
+    fn runtime_gauges_are_rendered() {
+        set("vram_bytes", 1024);
+        set("ram_bytes", 2048);
+        set("shared_weight_bytes", 4096);
+        set("kv_sessions", 2);
+        set("kv_ssd_writes", 0);
+        set("unknown", 1);
+        let text = render();
+        assert!(text.contains("olgp_vram_bytes 1024"));
+        assert!(text.contains("olgp_kv_sessions 2"));
     }
 }

@@ -63,5 +63,75 @@ class SdkTest(unittest.TestCase):
         self.assertEqual(client.token, "env-token")
 
 
+
+    def test_product_modules_cover_public_routes(self) -> None:
+        client = olgp.Client("http://box:8787", "token", memory_token="memory")
+        response = FakeResponse(json.dumps({"ok": True}).encode())
+        calls = [
+            lambda: client.speakers.list(),
+            lambda: client.speakers.retrieve("spk"),
+            lambda: client.speakers.update("spk", volume=35),
+            lambda: client.speakers.play("spk", url="https://example.test/a.wav"),
+            lambda: client.speakers.stop("spk"),
+            lambda: client.speakers.bluetooth("spk"),
+            lambda: client.speakers.startBluetoothPairing("spk"),
+            lambda: client.timers.list(),
+            lambda: client.timers.create(title="Tea", dueAtMs=1),
+            lambda: client.timers.cancel("timer"),
+            lambda: client.timers.snooze("timer", 60),
+            lambda: client.memos.list(),
+            lambda: client.memos.create(title="note"),
+            lambda: client.memos.dismiss("memo"),
+            lambda: client.phones.ring("phone"),
+            lambda: client.audio_memory.status(),
+            lambda: client.audio_memory.ready(),
+            lambda: client.audio_memory.settings(mode="active"),
+            lambda: client.audio_memory.episodes(),
+            lambda: client.audio_memory.notes(),
+            lambda: client.audio_memory.add_note("remember"),
+            lambda: client.audio_memory.query("remember"),
+            lambda: client.audio_memory.forget("note"),
+            lambda: client.audio_memory.clear(),
+            lambda: client.knowledge_bases.create("Docs"),
+            lambda: client.knowledge_bases.retrieve("kb"),
+            lambda: client.knowledge_bases.delete("kb"),
+            lambda: client.knowledge_bases.documents("kb"),
+            lambda: client.knowledge_bases.add_text("kb", "a.txt", "alpha"),
+            lambda: client.knowledge_bases.add_file("kb", "a.bin", "gamma"),
+            lambda: client.knowledge_bases.add_image("kb", "a.png", "data:image/png;base64,AA"),
+            lambda: client.knowledge_bases.query("kb", "alpha"),
+            lambda: client.images.jobs.create(operation="generate"),
+            lambda: client.images.jobs.result("job"),
+            lambda: client.images.jobs.cancel("job"),
+            lambda: client.recordings.create(True),
+            lambda: client.recordings.list(),
+            lambda: client.recordings.get("rec"),
+            lambda: client.recordings.delete("rec"),
+            lambda: client.recordings.append("rec", 0, "AA"),
+            lambda: client.recordings.finish("rec"),
+            lambda: client.recordings.reprocess("rec"),
+        ]
+        with mock.patch.object(
+            olgp.urllib.request,
+            "urlopen",
+            side_effect=[response for _ in calls],
+        ) as open_mock:
+            for call in calls:
+                self.assertEqual(call(), {"ok": True})
+        self.assertEqual(open_mock.call_count, len(calls))
+        memory_requests = [
+            call.args[0]
+            for call in open_mock.call_args_list
+            if "/v1/audio-memory" in call.args[0].full_url
+        ]
+        self.assertTrue(memory_requests)
+        self.assertTrue(
+            all(
+                request.get_header("X-wici-memory-token") == "memory"
+                or request.get_header("X-Wici-Memory-Token") == "memory"
+                for request in memory_requests
+            )
+        )
+
 if __name__ == "__main__":
     unittest.main()
