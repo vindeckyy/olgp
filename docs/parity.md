@@ -37,11 +37,11 @@ Sources: `https://wici.ai/wici-one`, `https://wici.ai/technology`,
 | Driver platforms | macOS, Windows, Vulkan ICD, D3D, games/CAD/video apps | Not implemented; no misleading stub ICD | structural/gap |
 | Benchmarks | Product tok/s, FPS, export, encode, latency tables | No equivalent hardware claims; benchmark harness reports local results | structural |
 
-OLGP's pairing exchange uses Noise XX, SPAKE2, Ed25519 proofs, and a displayed
-six-digit code. The public developer portal describes a simpler
-`expectedDeviceId`/`clientName` token request. OLGP intentionally keeps the
-stronger exchange; the observable window, scoped token, and revocation behavior
-match, but the wire request shape does not.
+OLGP supports both pairing request shapes. The stronger Noise XX / SPAKE2 /
+Ed25519 / six-digit-code exchange remains the default CLI path. `POST /v1/pairing`
+also accepts the documented `expectedDeviceId` and `clientName` fields during
+the same bounded first-pair or invitation window and returns a scoped
+`engine:read` / `engine:write` token.
 
 ## Verified live
 

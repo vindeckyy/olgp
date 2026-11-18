@@ -18,7 +18,7 @@ const MAX_JOBS: usize = 16;
 fn validate_request(operation: &str, request: &str) -> Result<(), String> {
     let value: Value = serde_json::from_str(request).map_err(|_| "invalid_request".to_owned())?;
     let parameters = value.get("parameters");
-    let mut integer = |key: &str| -> Option<u64> {
+    let integer = |key: &str| -> Option<u64> {
         parameters.and_then(|p| p.get(key)).and_then(Value::as_u64)
     };
     if let (Some(width), Some(height)) = (integer("width"), integer("height")) {

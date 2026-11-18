@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lumen_crypto::pairing::{ChannelBinding, DeviceIdentity, PairingCode};
+use lumen_crypto::pairing::{random_bytes, ChannelBinding, DeviceIdentity, PairingCode};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,7 +20,7 @@ use crate::config::Config;
 use tokio::io::copy_bidirectional;
 use crate::discovery::BoxInfo;
 use crate::product::ProductState;
-use crate::pairing::HostPairing;
+use crate::pairing::{Credential, HostPairing};
 use crate::registry::ModelRegistry;
 use crate::sched::Scheduler;
 use crate::telemetry;
@@ -389,12 +389,69 @@ async fn handle_request(
     }
 }
 
+fn simple_pairing_request(state: &GatewayState, request: &Value) -> Option<Vec<u8>> {
+    let expected = request.get("expectedDeviceId")?.as_str()?;
+    let client_name = request.get("clientName")?.as_str()?;
+    if client_name.is_empty() || expected != state.info.box_id {
+        return Some(error("invalid_request", "bad pairing fields", "400 Bad Request", false));
+    }
+    {
+        let window = state.pairing_window.lock().unwrap();
+        if window.map_or(true, |deadline| std::time::Instant::now() >= deadline) {
+            return Some(error("pairing_denied", "pairing window closed", "403 Forbidden", false));
+        }
+        let mut attempts = state.pairing_attempts.lock().unwrap();
+        if *attempts >= 5 {
+            return Some(error("pairing_denied", "too many attempts", "403 Forbidden", false));
+        }
+        *attempts += 1;
+    }
+    let token = hex(&random_bytes::<32>());
+    let proof = format!(
+        "olgp-simple-pairing-v1|{}|{}|{}",
+        state.info.box_id, client_name, token
+    );
+    let signature = hex(&state.identity.sign_bytes(proof.as_bytes()));
+    let credential = Credential {
+        box_id: state.info.box_id.clone(),
+        token: token.clone(),
+        host_key: hex(&state.identity.public_bytes()),
+        host_signature: signature,
+        box_spki_sha256: state.info.spki_sha256.clone(),
+        capabilities: state.info.capabilities.clone(),
+        paired_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string(),
+    };
+    if let Err(message) = state.trusted.lock().unwrap().add(&credential) {
+        return Some(error("internal_error", &message.to_string(), "500 Internal Server Error", false));
+    }
+    *state.pairing_window.lock().unwrap() = None;
+    Some(response(
+        "200 OK",
+        &json!({
+            "token": token,
+            "boxId": state.info.box_id,
+            "clientName": client_name,
+            "scopes": ["engine:read", "engine:write"],
+        })
+        .to_string(),
+    ))
+}
+
 fn pairing_request(state: &GatewayState, body: &str) -> Vec<u8> {
     let request: Value = match serde_json::from_str(body) {
         Ok(value) => value,
         Err(_) => return error("invalid_request", "bad JSON", "400 Bad Request", false),
     };
     let phase = request.get("phase").and_then(Value::as_str).unwrap_or("");
+    if phase.is_empty() {
+        if let Some(reply) = simple_pairing_request(state, &request) {
+            return reply;
+        }
+    }
     match phase {
         "begin" => {
             {
@@ -666,5 +723,21 @@ mod tests {
         let reply = handle_request("GET", "/engine/sessions", auth, "", &state).await;
         let body = String::from_utf8_lossy(&reply);
         assert!(body.contains("qwen25-0p5"));
+    }
+
+    #[tokio::test]
+    async fn simple_pairing_issues_scoped_token_and_closes_window() {
+        let state = state();
+        let body = format!(
+            "{{\"expectedDeviceId\":\"{}\",\"clientName\":\"test-client\"}}",
+            state.info.box_id
+        );
+        let reply = handle_request("POST", "/v1/pairing", "", &body, &state).await;
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.contains("\"scopes\":[\"engine:read\",\"engine:write\"]"));
+        let issued: Value = serde_json::from_str(text.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let token = issued["token"].as_str().unwrap();
+        assert!(state.trusted.lock().unwrap().is_valid(token));
+        assert!(state.pairing_window.lock().unwrap().is_none());
     }
 }
