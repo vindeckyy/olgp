@@ -216,4 +216,12 @@ mod tests {
         assert!(memory.notes().is_empty());
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn corrupt_store_is_reported() {
+        let path = temp_path();
+        fs::write(&path, "not json").unwrap();
+        assert!(AudioMemory::load(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
 }

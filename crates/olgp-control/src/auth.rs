@@ -132,4 +132,12 @@ mod tests {
         assert!(!store.is_valid("token"));
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn corrupt_store_is_reported() {
+        let path = std::env::temp_dir().join(format!("olgp-auth-bad-{}.json", std::process::id()));
+        fs::write(&path, "not json").unwrap();
+        assert!(TrustedClients::load(&path).is_err());
+        fs::remove_file(path).unwrap();
+    }
 }
