@@ -189,11 +189,17 @@ async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
     };
     let mut parts = first.split_whitespace();
     let method = parts.next().unwrap_or("").to_owned();
-    let path = parts.next().unwrap_or("").split('?').next().unwrap_or("").to_owned();
+    let raw_path = parts.next().unwrap_or("");
+    let path = raw_path.split('?').next().unwrap_or("").to_owned();
+    let mode = if raw_path.contains("mode=voice") {
+        crate::voice::VoiceMode::Voice
+    } else {
+        crate::voice::VoiceMode::Chat
+    };
     if path == "/v1/realtime"
         && head.lines().any(|line| line.to_ascii_lowercase().contains("upgrade: websocket"))
     {
-        tokio::spawn(crate::voice::serve(socket));
+        tokio::spawn(crate::voice::serve(socket, mode));
         return;
     }
     if path.starts_with("/v1/speakers/")

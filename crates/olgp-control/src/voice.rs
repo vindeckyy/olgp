@@ -76,11 +76,35 @@ fn text_frame(value: Value) -> Message {
     Message::Text(value.to_string().into())
 }
 
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VoiceMode {
+    Voice,
+    Chat,
+}
+
+impl VoiceMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Voice => "voice",
+            Self::Chat => "chat",
+        }
+    }
+
+    #[must_use]
+    pub fn max_turns(self) -> u32 {
+        match self {
+            Self::Voice => 1,
+            Self::Chat => 8,
+        }
+    }
+}
 /// Serve one voice WebSocket connection.
 ///
 /// # Errors
 /// Returns a WebSocket or IO error when the connection fails.
-pub async fn serve(socket: TcpStream) -> Result<(), String> {
+pub async fn serve(socket: TcpStream, mode: VoiceMode) -> Result<(), String> {
     let mut stream: WebSocketStream<TcpStream> = tokio_tungstenite::accept_async(socket)
         .await
         .map_err(|e| e.to_string())?;
@@ -88,11 +112,12 @@ pub async fn serve(socket: TcpStream) -> Result<(), String> {
         "type": "ready",
         "protocolVersion": 1,
         "sessionId": "olgp-voice",
-        "mode": "voice",
+        "mode": mode.as_str(),
         "audio": {"format": "pcm_s16le", "sampleRate": 24000, "channels": 1}
     });
     stream.send(text_frame(ready)).await.map_err(|e| e.to_string())?;
     let mut session = VoiceSession::default();
+    let mut committed_turns = 0u32;
     let mut speaking = false;
     let mut loud_frames = 0u32;
     while let Some(message) = stream.next().await {
@@ -138,10 +163,31 @@ pub async fn serve(socket: TcpStream) -> Result<(), String> {
                                 .await
                                 .map_err(|e| e.to_string())?;
                             speaking = true;
+                            committed_turns += 1;
+                            if committed_turns >= mode.max_turns() {
+                                stream
+                                    .send(text_frame(json!({
+                                        "type":"error",
+                                        "code":"turn_limit",
+                                        "message":"session turn limit reached",
+                                        "retryable":false,
+                                    })))
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                break;
+                            }
                         }
                     }
-                    "cancel" | "reset" => {
+                    "cancel" => {
                         session = VoiceSession::default();
+                        stream
+                            .send(text_frame(json!({"type":"end"})))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    "reset" => {
+                        session = VoiceSession::default();
+                        committed_turns = 0;
                         stream
                             .send(text_frame(json!({"type":"end"})))
                             .await
@@ -226,7 +272,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            serve(socket).await.unwrap();
+            serve(socket, VoiceMode::Chat).await.unwrap();
         });
         let stream = TcpStream::connect(address).await.unwrap();
         let (mut client, _) = client_async("ws://127.0.0.1/realtime", stream)
@@ -332,7 +378,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            serve(socket).await.unwrap();
+            serve(socket, VoiceMode::Chat).await.unwrap();
         });
         let stream = TcpStream::connect(address).await.unwrap();
         let (mut client, _) = client_async("ws://127.0.0.1/realtime", stream).await.unwrap();
@@ -362,7 +408,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            serve(socket).await.unwrap();
+            serve(socket, VoiceMode::Chat).await.unwrap();
         });
         let stream = TcpStream::connect(address).await.unwrap();
         let (mut client, _) = client_async("ws://127.0.0.1/realtime", stream).await.unwrap();
@@ -386,6 +432,44 @@ mod tests {
         assert!(committed.contains("input_committed"));
 
         client.close(None).await.unwrap();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn voice_modes_expose_documented_turn_limits() {
+        assert_eq!(VoiceMode::Voice.as_str(), "voice");
+        assert_eq!(VoiceMode::Chat.as_str(), "chat");
+        assert_eq!(VoiceMode::Voice.max_turns(), 1);
+        assert_eq!(VoiceMode::Chat.max_turns(), 8);
+    }
+
+    #[tokio::test]
+    async fn voice_mode_stops_after_one_committed_turn() {
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_tungstenite::client_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            serve(socket, VoiceMode::Voice).await.unwrap();
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut client, _) = client_async("ws://127.0.0.1/realtime?mode=voice", stream)
+            .await
+            .unwrap();
+        let ready = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(ready.contains("\"mode\":\"voice\""));
+        client
+            .send(Message::Text(json!({"type":"text_tentative","text":"answer"}).to_string().into()))
+            .await
+            .unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("text_tentative"));
+        client.send(Message::Text(json!({"type":"commit"}).to_string().into())).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"text\""));
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
+        let error = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(error.contains("turn_limit"));
         let _ = server.await;
     }
 }
