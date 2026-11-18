@@ -158,5 +158,26 @@ class SdkTest(unittest.TestCase):
         self.assertTrue(any(path.endswith("/v2/images/frames:process") for path in paths))
         self.assertTrue(any(path.endswith("/v2/images/jobs/img-1:cancel") for path in paths))
 
+
+    def test_search_headers_are_sent_when_configured(self) -> None:
+        client = olgp.Client(
+            "http://box:8787",
+            "token",
+            search_provider="tavily",
+            tavily_key="key",
+        )
+        response = FakeResponse(json.dumps({"choices": [{"message": {"content": "x"}}]}).encode())
+        with mock.patch.object(olgp.urllib.request, "urlopen", return_value=response) as open_mock:
+            client.models_list() if hasattr(client, "models_list") else client.chat("model", "hi")
+        request = open_mock.call_args.args[0]
+        self.assertTrue(
+            request.get_header("X-wici-search-provider") == "tavily"
+            or request.get_header("X-Wici-Search-Provider") == "tavily"
+        )
+        self.assertTrue(
+            request.get_header("X-wici-tavily-key") == "key"
+            or request.get_header("X-Wici-Tavily-Key") == "key"
+        )
+
 if __name__ == "__main__":
     unittest.main()

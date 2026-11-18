@@ -28,6 +28,8 @@ Sources: `https://wici.ai/wici-one`, `https://wici.ai/technology`,
 | Custom DRM | `/dev/dri` from a virtual PCI/platform device | GPL module with ioctls; static-checked only | partial |
 | Venus | Real Vulkan device in a guest | QEMU command generation and config validation | partial |
 | SDKs | TypeScript and Python documented functions | Four HTTP SDKs plus Rust core; product and engine helpers | implemented |
+| CLI probes | `wici-smi --workload`, `wici runtime check` | `olgp-smi --workload` and `olgpctl runtime check` | implemented |
+| Search headers | Caller-owned Tavily provider/key headers | All SDKs support optional `X-Wici-Search-*` headers | implemented |
 | Hardware SKU | RTX 5060 Ti/5090, Wi-Fi 7, NVMe, enclosure, PSU, cooling | Not reproducible in a protocol repo | structural |
 | Driver platforms | macOS, Windows, Vulkan ICD, D3D, games/CAD/video apps | Not implemented; no misleading stub ICD | structural/gap |
 | Benchmarks | Product tok/s, FPS, export, encode, latency tables | No equivalent hardware claims; benchmark harness reports local results | structural |

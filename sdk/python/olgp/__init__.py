@@ -281,10 +281,19 @@ class Client:
                 "POST", f"/v1/audio/recordings/{self._id(recording_id)}:reprocess"
             )
 
-    def __init__(self, base_url: str, token: str, memory_token: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        token: str,
+        memory_token: str | None = None,
+        search_provider: str | None = None,
+        tavily_key: str | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.memory_token = memory_token or os.environ.get("OLGP_MEMORY_TOKEN", "")
+        self.search_provider = search_provider or os.environ.get("OLGP_SEARCH_PROVIDER", "")
+        self.tavily_key = tavily_key or os.environ.get("TAVILY_API_KEY", "")
 
     def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None
@@ -292,6 +301,10 @@ class Client:
         headers = {"Authorization": f"Bearer {self.token}"}
         if self.memory_token and path.startswith("/v1/audio-memory"):
             headers["X-Wici-Memory-Token"] = self.memory_token
+        if self.search_provider:
+            headers["X-Wici-Search-Provider"] = self.search_provider
+        if self.tavily_key:
+            headers["X-Wici-Tavily-Key"] = self.tavily_key
         if method in ("POST", "PATCH"):
             headers["Content-Type"] = "application/json"
         data = json.dumps(payload).encode() if payload is not None else None
@@ -377,11 +390,15 @@ def connect(
     base_url: str | None = None,
     token: str | None = None,
     memory_token: str | None = None,
+    search_provider: str | None = None,
+    tavily_key: str | None = None,
 ) -> Client:
     return Client(
         base_url or os.environ.get("OLGP_BASE_URL", "http://olgp.local:8787"),
         token or os.environ.get("OLGP_DEVICE_TOKEN", ""),
         memory_token or os.environ.get("OLGP_MEMORY_TOKEN"),
+        search_provider or os.environ.get("OLGP_SEARCH_PROVIDER"),
+        tavily_key or os.environ.get("TAVILY_API_KEY"),
     )
 
 

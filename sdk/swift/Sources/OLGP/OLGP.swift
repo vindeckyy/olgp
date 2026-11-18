@@ -35,8 +35,16 @@ public final class Client {
     private let baseURL: URL
     private let token: String
     private let memoryToken: String
+    private let searchProvider: String?
+    private let tavilyKey: String?
 
-    public init(baseURL: String? = nil, token: String? = nil, memoryToken: String? = nil) throws {
+    public init(
+        baseURL: String? = nil,
+        token: String? = nil,
+        memoryToken: String? = nil,
+        searchProvider: String? = nil,
+        tavilyKey: String? = nil
+    ) throws {
         let value = baseURL ?? ProcessInfo.processInfo.environment["OLGP_BASE_URL"]
             ?? "http://olgp.local:8787"
         guard let url = URL(string: value) else {
@@ -45,11 +53,25 @@ public final class Client {
         self.baseURL = url
         self.token = token ?? ProcessInfo.processInfo.environment["OLGP_DEVICE_TOKEN"] ?? ""
         self.memoryToken = memoryToken ?? ProcessInfo.processInfo.environment["OLGP_MEMORY_TOKEN"] ?? ""
+        let env = ProcessInfo.processInfo.environment
+        self.searchProvider = searchProvider ?? env["OLGP_SEARCH_PROVIDER"]
+        self.tavilyKey = tavilyKey ?? env["TAVILY_API_KEY"] ?? env["OLGP_TAVILY_KEY"]
     }
+
+    private func applyAuthHeaders(_ request: inout URLRequest) {
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let searchProvider = searchProvider, !searchProvider.isEmpty {
+            request.setValue(searchProvider, forHTTPHeaderField: "X-Wici-Search-Provider")
+        }
+        if let tavilyKey = tavilyKey, !tavilyKey.isEmpty {
+            request.setValue(tavilyKey, forHTTPHeaderField: "X-Wici-Tavily-Key")
+        }
+    }
+
     public func chat(model: String, messages: [ChatMessage]) async throws -> String {
         var request = URLRequest(url: baseURL.appendingPathComponent("/v1/chat/completions"))
         request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        applyAuthHeaders(&request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(
             ChatCompletionRequest(model: model, messages: messages)
@@ -76,7 +98,7 @@ public final class Client {
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        applyAuthHeaders(&request)
         if memory, !memoryToken.isEmpty {
             request.setValue(memoryToken, forHTTPHeaderField: "X-Wici-Memory-Token")
         }
@@ -440,7 +462,15 @@ public final class Client {
 public func connect(
     baseURL: String? = nil,
     token: String? = nil,
-    memoryToken: String? = nil
+    memoryToken: String? = nil,
+    searchProvider: String? = nil,
+    tavilyKey: String? = nil
 ) throws -> Client {
-    try Client(baseURL: baseURL, token: token, memoryToken: memoryToken)
+    try Client(
+        baseURL: baseURL,
+        token: token,
+        memoryToken: memoryToken,
+        searchProvider: searchProvider,
+        tavilyKey: tavilyKey
+    )
 }

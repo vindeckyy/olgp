@@ -23,6 +23,33 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const JOB_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Caller-owned search credentials forwarded on API requests.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchOptions {
+    pub search_provider: Option<String>,
+    pub tavily_key: Option<String>,
+}
+
+impl SearchOptions {
+    /// Fill missing values from the environment.
+    pub fn resolve(search_provider: Option<String>, tavily_key: Option<String>) -> Self {
+        let env_value = |name: &str| env::var(name).ok().filter(|value| !value.is_empty());
+        Self {
+            search_provider: search_provider.or_else(|| env_value("OLGP_SEARCH_PROVIDER")),
+            tavily_key: tavily_key
+                .or_else(|| env_value("OLGP_TAVILY_KEY"))
+                .or_else(|| env_value("TAVILY_API_KEY")),
+        }
+    }
+}
+
+fn validate_header_value(name: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(|char| char == '\r' || char == '\n') {
+        return Err(format!("invalid {name}: control characters"));
+    }
+    Ok(())
+}
+
 /// A box found by `olgpctl discover`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BoxInfo {
@@ -204,6 +231,26 @@ fn build_request(
     request
 }
 
+fn with_search_headers(request: String, search: &SearchOptions) -> String {
+    let mut headers = String::new();
+    if let Some(provider) = &search.search_provider {
+        headers.push_str(&format!("X-Wici-Search-Provider: {provider}\r\n"));
+    }
+    if let Some(key) = &search.tavily_key {
+        headers.push_str(&format!("X-Wici-Tavily-Key: {key}\r\n"));
+    }
+    if headers.is_empty() {
+        return request;
+    }
+    let anchor = request
+        .find("Content-Type: application/json\r\n")
+        .or_else(|| request.find("Content-Length: "))
+        .unwrap_or(request.len());
+    let mut result = request;
+    result.insert_str(anchor, &headers);
+    result
+}
+
 fn decode_chunked(body: &str) -> Result<String, String> {
     let mut rest = body;
     let mut out = String::new();
@@ -261,11 +308,15 @@ struct Runtime {
     port: u16,
     authority: String,
     token: String,
+    search: SearchOptions,
 }
 
 impl Runtime {
     fn send(&self, method: &str, path: &str, body: Option<&str>) -> Result<HttpResponse, String> {
-        let request = build_request(method, &self.authority, path, &self.token, body);
+        let request = with_search_headers(
+            build_request(method, &self.authority, path, &self.token, body),
+            &self.search,
+        );
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .map_err(|error| format!("connect {}:{}: {error}", self.host, self.port))?;
         stream
@@ -322,17 +373,32 @@ pub struct Client {
 }
 
 impl Client {
-    /// Build a client for a base URL and Device Token.
+    /// Build a client for a base URL and Device Token, with search headers from the environment.
     pub fn new(base_url: &str, token: &str) -> Result<Self, String> {
+        Self::new_with_options(base_url, token, SearchOptions::default())
+    }
+
+    /// Build a client with explicit search credentials; missing values fall back to the environment.
+    pub fn new_with_options(
+        base_url: &str,
+        token: &str,
+        options: SearchOptions,
+    ) -> Result<Self, String> {
         let (host, port, authority) = split_base_url(base_url)?;
-        if token.chars().any(|char| char == '\r' || char == '\n') {
-            return Err("invalid token: control characters".into());
+        validate_header_value("token", token)?;
+        let search = SearchOptions::resolve(options.search_provider, options.tavily_key);
+        if let Some(provider) = &search.search_provider {
+            validate_header_value("search provider", provider)?;
+        }
+        if let Some(key) = &search.tavily_key {
+            validate_header_value("Tavily key", key)?;
         }
         let inner = Arc::new(Runtime {
             host,
             port,
             authority,
             token: token.to_owned(),
+            search,
         });
         Ok(Self {
             chat: Chat {
@@ -820,6 +886,73 @@ mod tests {
              Content-Length: 7\r\n\
              \r\n\
              {\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn adds_search_headers_when_configured() {
+        let request = with_search_headers(
+            build_request(
+                "POST",
+                "olgp.local:8787",
+                "/v1/chat/completions",
+                "token123",
+                Some("{\"a\":1}"),
+            ),
+            &SearchOptions {
+                search_provider: Some("tavily".into()),
+                tavily_key: Some("key".into()),
+            },
+        );
+        assert_eq!(
+            request,
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: olgp.local:8787\r\n\
+             Connection: close\r\n\
+             Authorization: Bearer token123\r\n\
+             X-Wici-Search-Provider: tavily\r\n\
+             X-Wici-Tavily-Key: key\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 7\r\n\
+             \r\n\
+             {\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn search_headers_are_optional_and_reject_injection() {
+        let plain = with_search_headers(
+            build_request("GET", "olgp.local:8787", "/v1/models", "", None),
+            &SearchOptions::default(),
+        );
+        assert!(!plain.contains("X-Wici-"));
+        assert!(Client::new_with_options(
+            "http://olgp.local:8787",
+            "ok",
+            SearchOptions {
+                search_provider: Some("tavily\r\nX-Injected: 1".into()),
+                tavily_key: None,
+            },
+        )
+        .is_err());
+        let client = Client::new_with_options(
+            "http://olgp.local:8787",
+            "ok",
+            SearchOptions {
+                search_provider: Some("tavily".into()),
+                tavily_key: Some("key".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .chat
+                .completions
+                .inner
+                .search
+                .search_provider
+                .as_deref(),
+            Some("tavily")
         );
     }
 

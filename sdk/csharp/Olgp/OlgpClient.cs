@@ -19,7 +19,12 @@ public sealed class OlgpClient
     private readonly HttpClient _http;
     private readonly string? _memoryToken;
 
-    public OlgpClient(string? baseUrl = null, string? token = null, string? memoryToken = null)
+    public OlgpClient(
+        string? baseUrl = null,
+        string? token = null,
+        string? memoryToken = null,
+        string? searchProvider = null,
+        string? tavilyKey = null)
     {
         var address = baseUrl
             ?? Environment.GetEnvironmentVariable("OLGP_BASE_URL")
@@ -28,6 +33,17 @@ public sealed class OlgpClient
         var credential = token ?? Environment.GetEnvironmentVariable("OLGP_DEVICE_TOKEN") ?? "";
         _http.DefaultRequestHeaders.Add("Authorization", $"Bearer {credential}");
         _memoryToken = memoryToken ?? Environment.GetEnvironmentVariable("OLGP_MEMORY_TOKEN");
+        searchProvider ??= Environment.GetEnvironmentVariable("OLGP_SEARCH_PROVIDER");
+        tavilyKey ??= Environment.GetEnvironmentVariable("OLGP_TAVILY_KEY")
+            ?? Environment.GetEnvironmentVariable("TAVILY_API_KEY");
+        if (!string.IsNullOrEmpty(searchProvider))
+        {
+            _http.DefaultRequestHeaders.Add("X-Wici-Search-Provider", searchProvider);
+        }
+        if (!string.IsNullOrEmpty(tavilyKey))
+        {
+            _http.DefaultRequestHeaders.Add("X-Wici-Tavily-Key", tavilyKey);
+        }
         Speakers = new SpeakerRoutes(this);
         Timers = new TimerRoutes(this);
         Memos = new MemoRoutes(this);
@@ -506,6 +522,8 @@ public static class Olgp
     public static OlgpClient Connect(
         string? baseUrl = null,
         string? token = null,
-        string? memoryToken = null) =>
-        new(baseUrl, token, memoryToken);
+        string? memoryToken = null,
+        string? searchProvider = null,
+        string? tavilyKey = null) =>
+        new(baseUrl, token, memoryToken, searchProvider, tavilyKey);
 }

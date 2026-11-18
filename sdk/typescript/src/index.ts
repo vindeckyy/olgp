@@ -16,6 +16,8 @@ export interface OlgpClientOptions {
   baseUrl?: string;
   token?: string;
   memoryToken?: string;
+  searchProvider?: string;
+  tavilyKey?: string;
 }
 
 export interface ImageJobPollOptions {
@@ -38,11 +40,15 @@ export class OlgpClient {
   private readonly baseUrl: string;
   private readonly token: string;
   private readonly memoryToken: string;
+  private readonly searchProvider: string;
+  private readonly tavilyKey: string;
 
   constructor(options: OlgpClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? process.env.OLGP_BASE_URL ?? "http://olgp.local:8787").replace(/\/$/, "");
     this.token = options.token ?? process.env.OLGP_DEVICE_TOKEN ?? "";
     this.memoryToken = options.memoryToken ?? process.env.OLGP_MEMORY_TOKEN ?? "";
+    this.searchProvider = options.searchProvider ?? process.env.OLGP_SEARCH_PROVIDER ?? "";
+    this.tavilyKey = options.tavilyKey ?? process.env.OLGP_TAVILY_KEY ?? "";
   }
 
   private async request<T = unknown>(
@@ -54,6 +60,12 @@ export class OlgpClient {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.token}`,
     };
+    if (this.searchProvider) {
+      headers["X-Wici-Search-Provider"] = this.searchProvider;
+    }
+    if (this.tavilyKey) {
+      headers["X-Wici-Tavily-Key"] = this.tavilyKey;
+    }
     if (memory) {
       headers["X-Wici-Memory-Token"] = this.memoryToken;
     }
