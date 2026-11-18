@@ -408,6 +408,9 @@ impl Client {
             },
             engine: Engine {
                 inner: inner.clone(),
+                sessions: EngineSessions {
+                    inner: inner.clone(),
+                },
             },
             speakers: Speakers {
                 inner: inner.clone(),
@@ -597,6 +600,8 @@ impl Completions {
 #[derive(Clone, Debug)]
 pub struct Engine {
     inner: Arc<Runtime>,
+    /// Session operations. `sessions()` remains the list call.
+    pub sessions: EngineSessions,
 }
 
 impl Engine {
@@ -610,6 +615,30 @@ impl Engine {
 
     pub fn sessions(&self) -> Result<Value, String> {
         self.inner.json("GET", "/engine/sessions", None)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EngineSessions {
+    inner: Arc<Runtime>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct EngineSession {
+    pub id: String,
+    pub model: String,
+    pub task: String,
+    pub state: String,
+}
+
+impl EngineSessions {
+    pub fn create(&self, model: &str, task: &str) -> Result<EngineSession, String> {
+        let value = self.inner.json(
+            "POST",
+            "/engine/sessions",
+            Some(&json!({"model": model, "task": task})),
+        )?;
+        serde_json::from_value(value).map_err(|error| format!("engine session parse: {error}"))
     }
 }
 
@@ -1117,5 +1146,45 @@ mod tests {
         let body = "{\"error\":{\"code\":\"result_unavailable\"}}";
         let parsed = parse_json_body(body).unwrap();
         assert_eq!(parsed["error"]["code"], "result_unavailable");
+    }
+
+    #[test]
+    fn creates_engine_session() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected = build_request(
+            "POST",
+            &format!("127.0.0.1:{port}"),
+            "/engine/sessions",
+            "tok",
+            Some(&json!({"model": "qwen25-0p5", "task": "summarize"}).to_string()),
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = vec![0; expected.len()];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(request.as_slice(), expected.as_bytes());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"id\":\"s1\",\"model\":\"qwen25-0p5\",\"task\":\"summarize\",\"state\":\"ready\"}")
+                .unwrap();
+        });
+        let client = Client::new(&format!("http://127.0.0.1:{port}"), "tok").unwrap();
+        let session = client
+            .engine
+            .sessions
+            .create("qwen25-0p5", "summarize")
+            .unwrap();
+        assert_eq!(
+            session,
+            EngineSession {
+                id: "s1".into(),
+                model: "qwen25-0p5".into(),
+                task: "summarize".into(),
+                state: "ready".into(),
+            }
+        );
+        server.join().unwrap();
     }
 }

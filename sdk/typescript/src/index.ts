@@ -1,4 +1,17 @@
 type Json = Record<string, unknown>;
+
+export type EngineSessionCreateInput = {
+  model: string;
+  task: string;
+};
+
+export interface EngineSession {
+  id: string;
+  model: string;
+  task: string;
+  state: "ready";
+}
+
 type DocumentsApi = {
   (knowledgeBaseId: string, payload?: Json): Promise<unknown>;
   list(knowledgeBaseId: string): Promise<unknown>;
@@ -190,7 +203,13 @@ export class OlgpClient {
   readonly engine = {
     status: () => this.request("GET", "/engine/status"),
     capabilities: () => this.request("GET", "/engine/capabilities"),
-    sessions: () => this.request("GET", "/engine/sessions"),
+    sessions: Object.assign(
+      () => this.request("GET", "/engine/sessions"),
+      {
+        create: (input: EngineSessionCreateInput) =>
+          this.request<EngineSession>("POST", "/engine/sessions", input),
+      },
+    ),
   };
 
   readonly images = {

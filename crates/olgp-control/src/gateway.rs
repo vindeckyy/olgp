@@ -37,6 +37,7 @@ struct GatewayState {
     trusted: Mutex<TrustedClients>,
     scheduler: Mutex<Scheduler>,
     registry: Mutex<ModelRegistry>,
+    engine_sessions: Mutex<Vec<Value>>,
 }
 fn response(status: &str, body: &str) -> Vec<u8> {
     format!(
@@ -308,7 +309,31 @@ async fn handle_request(
             "200 OK",
             &json!({"service":"olgp-engine","apiVersion":1,"sessions":true}).to_string(),
         ),
-        ("GET", "/engine/sessions") => response("200 OK", "{\"sessions\":[]}\n"),
+        ("GET", "/engine/sessions") => response(
+            "200 OK",
+            &json!({"sessions":state.engine_sessions.lock().unwrap().clone()}).to_string(),
+        ),
+        ("POST", "/engine/sessions") => {
+            let request: Value = match serde_json::from_str(body) {
+                Ok(value) => value,
+                Err(_) => return error("invalid_request", "bad JSON", "400 Bad Request", false),
+            };
+            let model = request.get("model").and_then(Value::as_str).unwrap_or("").to_owned();
+            let task = request.get("task").and_then(Value::as_str).unwrap_or("").to_owned();
+            if model.is_empty() || task.is_empty() {
+                return error("invalid_request", "model and task are required", "400 Bad Request", false);
+            }
+            let id = format!(
+                "sess-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let session = json!({"id":id,"model":model,"task":task,"state":"ready"});
+            state.engine_sessions.lock().unwrap().push(session.clone());
+            response("201 Created", &session.to_string())
+        }
         ("POST", "/v1/chat/completions")
         | ("POST", "/v1/responses")
         | ("POST", "/v1/embeddings")
@@ -540,6 +565,7 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         trusted,
         scheduler,
         registry,
+        engine_sessions: Mutex::new(Vec::new()),
     });
     let upstream = SocketAddr::from(([127, 0, 0, 1], 14833));
 
@@ -594,10 +620,7 @@ mod tests {
             pairing_code: PairingCode::new(123456),
             engine_port: 18080,
             product: None,
-            trusted: Mutex::new(
-                TrustedClients::load(&std::path::PathBuf::from("/tmp/olgp-gateway-trusted.json"))
-                    .unwrap(),
-            ),
+            trusted: Mutex::new(TrustedClients::with_token("test-token")),
             scheduler: Mutex::new(Scheduler::new(
                 4096 * 1024 * 1024,
                 16 * 1024 * 1024 * 1024,
@@ -605,6 +628,7 @@ mod tests {
                 1,
             )),
             registry: Mutex::new(ModelRegistry::default()),
+            engine_sessions: Mutex::new(Vec::new()),
         }
     }
 
@@ -622,5 +646,25 @@ mod tests {
         assert!(body.contains("\"type\":\"invalid_request_error\""));
         assert!(body.contains("\"param\":null"));
         assert!(body.contains("\"retryable\":false"));
+    }
+
+    #[tokio::test]
+    async fn engine_session_can_be_created_and_listed() {
+        let state = state();
+        let auth = "Authorization: Bearer test-token";
+        let reply = handle_request(
+            "POST",
+            "/engine/sessions",
+            auth,
+            "{\"model\":\"qwen25-0p5\",\"task\":\"chat\"}",
+            &state,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&reply);
+        assert!(body.contains("201 Created"));
+        assert!(body.contains("\"state\":\"ready\""));
+        let reply = handle_request("GET", "/engine/sessions", auth, "", &state).await;
+        let body = String::from_utf8_lossy(&reply);
+        assert!(body.contains("qwen25-0p5"));
     }
 }

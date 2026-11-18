@@ -1,6 +1,6 @@
 # v1/v2 route contract
 
-Sixty-four public routes are defined in v1, v2, and the local engine namespace.
+Sixty-five public routes are defined in v1, v2, and the local engine namespace.
 `scripts/check-contract.sh` verifies that this list matches
 `crates/olgp-control/src/api.rs`.
 
@@ -70,6 +70,7 @@ Sixty-four public routes are defined in v1, v2, and the local engine namespace.
 | GET | `/engine/status` | Device Token |
 | GET | `/engine/capabilities` | Device Token |
 | GET | `/engine/sessions` | Device Token |
+| POST | `/engine/sessions` | Device Token |
 
 Voice events: `ready`, `text_input`, `commit`, `cancel`, `reset`,
 `input_committed`, `stt_partial`, `stt_final`, `text_tentative`, `text`, `end`,

@@ -46,6 +46,20 @@ impl TrustedClients {
         self.clients.is_empty()
     }
     /// Check a bearer token.
+
+    /// Build an in-memory store for deterministic tests.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_token(token: &str) -> Self {
+        Self {
+            path: PathBuf::from("/tmp/olgp-unused-trusted-clients.json"),
+            clients: vec![TrustedClient {
+                token: token.into(),
+                client_public: "00".into(),
+                paired_at: "2026-01-01T00:00:00Z".into(),
+            }],
+        }
+    }
     #[must_use]
     pub fn is_valid(&self, token: &str) -> bool {
         self.clients.iter().any(|client| client.token == token)

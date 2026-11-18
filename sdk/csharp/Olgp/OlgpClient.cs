@@ -470,6 +470,9 @@ public sealed class OlgpClient
 
         public Task<JsonElement> SessionsAsync() =>
             client.SendAsync(HttpMethod.Get, "/engine/sessions");
+
+        public Task<JsonElement> SessionsCreateAsync(string model, string task) =>
+            client.SendAsync(HttpMethod.Post, "/engine/sessions", new { model, task });
     }
 
     public sealed class RecordingRoutes(OlgpClient client)

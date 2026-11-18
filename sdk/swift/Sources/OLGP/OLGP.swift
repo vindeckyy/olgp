@@ -350,6 +350,10 @@ public final class Client {
         try await object("GET", "/engine/sessions")
     }
 
+    public func engineSessionsCreate(model: String, task: String) async throws -> [String: Any] {
+        try await object("POST", "/engine/sessions", body: ["model": model, "task": task])
+    }
+
     // MARK: - Image jobs
 
     public func imagesJobsCreate(

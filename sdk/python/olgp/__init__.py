@@ -184,8 +184,18 @@ class Client:
         def capabilities(self) -> Any:
             return self._client._request("GET", "/engine/capabilities")
 
-        def sessions(self) -> Any:
-            return self._client._request("GET", "/engine/sessions")
+        class Sessions(_Module):
+            def __call__(self) -> Any:
+                return self._client._request("GET", "/engine/sessions")
+
+            def create(self, model: str, task: str) -> Any:
+                return self._client._request(
+                    "POST", "/engine/sessions", {"model": model, "task": task}
+                )
+
+        @property
+        def sessions(self) -> "Client.Engine.Sessions":
+            return self.Sessions(self._client)
 
     class Images(_Module):
         def frames_process(self, **fields: Any) -> Any:

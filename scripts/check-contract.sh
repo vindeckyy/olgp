@@ -16,8 +16,8 @@ route_rows = re.findall(r"^\| (GET|POST|PATCH|DELETE|WS) \| `([^`]+)` \|", contr
 route_count = len(route_rows)
 api_routes = set(re.findall(r'method: "(\w+)", path: "([^"]+)"', api))
 contract_routes = {(method, path.split("?")[0]) for method, path in route_rows}
-if route_count != 64:
-    raise SystemExit(f"contract has {route_count} routes, expected 64")
+if route_count != 65:
+    raise SystemExit(f"contract has {route_count} routes, expected 65")
 missing = contract_routes - api_routes
 extra = api_routes - contract_routes
 if missing or extra:
