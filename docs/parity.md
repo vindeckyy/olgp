@@ -24,6 +24,7 @@ Sources: `https://wici.ai/wici-one`, `https://wici.ai/technology`,
 | Semantic transport | Batching, trace replay, content cache | C++ dispatch with batch wire codec, trace sessions, and cache counters | partial |
 | Scheduler | VRAM/RAM residency, parked processes | Lease scheduler plus shared-weight registry in metrics | partial |
 | Voice | voice-v1 events, PCM, early answers, interruption | WS events, deterministic gate, configurable ASR config, barge-in | partial |
+| Recordings ASR | Transcript lifecycle with external ASR | `OLGP_ASR_CMD` hook stores real segments; honest `asr_unavailable` otherwise | partial |
 | GPU recognition | CUDA/NVML shims on Linux | LUPINE-derived shims with SPKI pin and system-wide preload | partial |
 | Custom DRM | `/dev/dri` from a virtual PCI/platform device | GPL module with ioctls; static-checked only | partial |
 | Venus | Real Vulkan device in a guest | QEMU command generation and config validation | partial |
