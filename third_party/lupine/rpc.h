@@ -1,0 +1,596 @@
+#ifndef RPC_H
+#define RPC_H
+
+#include "lupine_platform.h"
+#include <chrono>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <stdint.h>
+#include <unordered_map>
+#include <vector>
+#include "codegen/gen_rpc_ids.h"
+
+// Chunk size shared by the client and server for transfers split across
+// multiple RPC responses. This bounds staging independently of HTTP content
+// encoding, which is transparent to the RPC layer.
+#define LUPINE_RPC_TRANSFER_CHUNK_BYTES (4 * 1024 * 1024)
+
+// Server-originated operations run on the client's dispatch thread. CUDA host
+// functions, stream callbacks, and driver log callbacks use these requests for
+// side effects that occur outside the original API call.
+static constexpr int LUPINE_SIDE_EFFECT_HOST_FUNCTION = 1;
+static constexpr int LUPINE_SIDE_EFFECT_STREAM_CALLBACK = 2;
+static constexpr int LUPINE_SIDE_EFFECT_READ_HOST_MEMORY = 3;
+static constexpr int LUPINE_SIDE_EFFECT_LOG_CALLBACK = 4;
+
+// OLGP extension opcodes. These are disjoint from generated CUDA/HIP RPC IDs.
+static constexpr int OLGP_OP_BASE = 0x8000;
+static constexpr int OLGP_OP_CACHE_QUERY = OLGP_OP_BASE + 1;
+static constexpr int OLGP_OP_CACHE_PUT = OLGP_OP_BASE + 2;
+static constexpr int OLGP_OP_BATCH = OLGP_OP_BASE + 3;
+static constexpr int OLGP_OP_TRACE_BEGIN = OLGP_OP_BASE + 4;
+static constexpr int OLGP_OP_TRACE_REPLAY = OLGP_OP_BASE + 5;
+static constexpr int OLGP_OP_TRACE_ABORT = OLGP_OP_BASE + 6;
+static constexpr int OLGP_OP_HANDLE_RETAIN = OLGP_OP_BASE + 7;
+static constexpr int OLGP_OP_HANDLE_RELEASE = OLGP_OP_BASE + 8;
+static constexpr int OLGP_OP_LEASE = OLGP_OP_BASE + 9;
+
+static constexpr uint8_t LUPINE_COPY_DIRECTION_HTOH = 0;
+static constexpr uint8_t LUPINE_COPY_DIRECTION_HTOD = 1;
+static constexpr uint8_t LUPINE_COPY_DIRECTION_DTOH = 2;
+static constexpr uint8_t LUPINE_COPY_DIRECTION_DTOD = 3;
+
+// Wire CUstream sentinels for RPC_cuMemcpyDtoH_v2 demand fetches, above
+// CU_STREAM_LEGACY (0x1) and CU_STREAM_PER_THREAD (0x2) and below aligned
+// stream pointers. READY copies on a private non-blocking stream once prior
+// device work is already synchronized; SYNC_ALL synchronizes the context
+// first when multiple streams may have written the allocation.
+static constexpr uintptr_t LUPINE_STREAM_FETCH_READY_BITS = 0x3;
+static constexpr uintptr_t LUPINE_STREAM_FETCH_SYNC_ALL_BITS = 0x4;
+
+// Where the dense bytes of a pushed device-to-host copy land in client
+// memory: depth slices of height rows of width bytes. A linear copy is one row.
+// Sent as-is ahead of the bytes.
+struct lupine_host_rows {
+  void *dst = nullptr;
+  size_t width = 0;
+  size_t height = 1;
+  size_t pitch = 0;
+  size_t depth = 1;
+  size_t slice = 0;
+
+  size_t bytes() const { return width * height * depth; }
+  unsigned char *row(size_t index) const {
+    return static_cast<unsigned char *>(dst) + index / height * slice +
+           index % height * pitch;
+  }
+};
+
+// References caller-owned bytes while an RPC is being serialized. Cursors are
+// consumed directly by the HTTP/2 transport.
+struct rpc_write_cursor;
+// A refill supplies a non-empty cursor and returns positive, returns zero at
+// end of input, or returns negative on failure.
+using rpc_write_cursor_refill = int (*)(void *context,
+                                        rpc_write_cursor *cursor);
+
+struct rpc_write_cursor {
+  const unsigned char *data = nullptr;
+  size_t size = 0;
+  rpc_write_cursor_refill refill = nullptr;
+  void *refill_context = nullptr;
+
+  rpc_write_cursor() = default;
+
+  rpc_write_cursor(const void *bytes, size_t byte_count)
+      : data(static_cast<const unsigned char *>(bytes)), size(byte_count) {}
+
+  rpc_write_cursor(rpc_write_cursor_refill refill_fn, void *context)
+      : refill(refill_fn), refill_context(context) {}
+
+  size_t remaining() const { return size; }
+  bool pending() const { return size != 0 || refill != nullptr; }
+};
+
+// Remote accelerator and pinned-host addresses live in this upper canonical
+// VA band. Driver shims map their application and transport views at fixed
+// offsets from that address, so the RPC core can translate without knowing
+// which accelerator backend owns the allocation.
+static constexpr uintptr_t LUPINE_HOST_ALLOCATION_SERVER_BASE =
+    UINT64_C(0x700000000000);
+static constexpr uintptr_t LUPINE_HOST_ALLOCATION_WINDOW_SIZE =
+    UINT64_C(0x100000000000);
+static constexpr intptr_t LUPINE_HOST_ALLOCATION_R_OFFSET =
+    -INT64_C(0x500000000000);
+static constexpr intptr_t LUPINE_HOST_ALLOCATION_W_OFFSET =
+    -INT64_C(0x400000000000);
+
+// Each connection owns a disjoint identity-mapped arena. The client also
+// reserves a writable alias so pointers embedded in host allocation memory
+// retain their server values while transport reads avoid the protected R view.
+// Keep both bands above the legacy R/W offset views [0x200000000000,
+// 0x400000000000) and below Linux x86_64 PIE ET_DYN_BASE (0x555555554000) and
+// 32-bit ASLR mmap_base [0x700000000000, 0x800000000000), so a sibling server's
+// own ASLR mappings do not collide with another connection's slot when
+// replicating portable host allocations at fixed addresses.
+static constexpr uintptr_t LUPINE_VA_FIRST_BASE = UINT64_C(0x400000000000);
+static constexpr size_t LUPINE_VA_ARENA_SIZE = UINT64_C(0x010000000000);
+static constexpr unsigned int LUPINE_VA_ARENA_COUNT = 8;
+// The writable alias is client-private and never a device address, so it keeps
+// its own region instead of tracking the arena. Offsetting from the arena base
+// cannot work for every window: a positive offset from a high base leaves
+// canonical user space, and a negative one underflows from a low base.
+static constexpr uintptr_t LUPINE_VA_WRITE_BASE = UINT64_C(0x480000000000);
+
+// The address range a peer is able to host arenas in. The server's driver
+// decides this, so the server states it and the client carves its own arenas
+// out of it; the arena base must be a numeric address both ends can hold, which
+// no single constant satisfies across platforms. How the range is subdivided is
+// the client's business, so only the bounds travel.
+struct lupine_va_window {
+  uintptr_t base;
+  size_t size;
+};
+extern lupine_va_window lupine_va_local_window(void);
+
+struct rpc_host_allocation_write {
+  uintptr_t start;
+  size_t size;
+};
+
+// The server's HTTP/2 receive window, and with it the ceiling on the pinned
+// staging a client can hold there: fire-and-forget device-bound payload bytes
+// stay uncredited until the staging buffer they landed in retires.
+#define LUPINE_FF_STAGING_WINDOW_BYTES (64ull * 1024 * 1024)
+
+// The largest pageable async host-to-device copy the driver stages before
+// returning without waiting for the stream (measured on driver 580.95: a
+// 64 KiB copy returns in microseconds behind a busy stream, one byte more
+// waits for it). Up to this size the server hands pushed bytes to the driver
+// directly, so the client need not wait for the reply.
+#define LUPINE_INLINE_HTOD_BYTES (64ull * 1024)
+
+typedef struct conn_t conn_t;
+
+// Requests are ordered against earlier unanswered ones either connection-wide
+// or by the objects they touch. A scope key is an object's handle (a stream or
+// an event); these values are not handles. RPC_SCOPE_ALL orders a request
+// behind every earlier unanswered one. RPC_SCOPE_NONE orders a request
+// touching no object only behind earlier ones that touched none, and makes an
+// unanswered one an object every later request waits for; RPC_SCOPE_LANE also
+// publishes nothing, so only the sender's own lane follows it.
+static constexpr uintptr_t RPC_SCOPE_NONE = 0;
+static constexpr uintptr_t RPC_SCOPE_LANE = ~uintptr_t{0};
+static constexpr uintptr_t RPC_SCOPE_ALL = ~uintptr_t{2};
+// Host memory a client sends to the server's copy goes in order on a lane of
+// its own and waits for nothing, so it never queues behind a handler that is
+// blocked, possibly on a callback that is waiting to send it; every later
+// request waits for it.
+static constexpr uintptr_t RPC_SCOPE_HOST_WRITES = ~uintptr_t{1};
+
+// A soft request checks what it is ordered behind instead of waiting for it,
+// so a query can say that work is not submitted yet; its handler asks
+// rpc_request_unsettled. Every later scoped request waits for one that
+// publishes the connection: for work that touches objects the request does
+// not name, such as events a graph records.
+enum : unsigned { RPC_REQUEST_SOFT = 1, RPC_REQUEST_PUBLISH_CONNECTION = 2 };
+
+// The last unanswered request on an object, and the lane that sent it.
+struct rpc_scope_ticket {
+  uint64_t ticket = ~uint64_t{0};
+  int32_t lane = -1;
+};
+
+// What the request being built is ordered against. A connection-wide request
+// waits for every unanswered request published before it was started. A
+// scoped one waits only for the last unanswered request another lane sent on
+// each of its objects, and for the last one that touched no object: its own
+// lane's requests are already in order. A soft request checks those instead
+// of waiting for them, so a query can say they are not done yet.
+// A client request leads with wait markers: {0, 0, n} waits for every ticket
+// below n, {0, 1, t} for ticket t, and {0, 2, t} only checks it.
+struct rpc_wait_marker {
+  int zero;
+  int kind;
+  uint64_t value;
+};
+
+struct rpc_request_scope {
+  bool scoped = false;
+  bool publish_connection = false;
+  bool publish_host_writes = false;
+  bool soft = false;
+  std::vector<uintptr_t> keys; // objects later requests order behind it on
+  std::vector<rpc_wait_marker> waits;
+  // Retired scopes this request waits for, dropped once it publishes.
+  size_t retired_count = 0;
+};
+
+// The request or response being built. A request nested in a response swaps
+// the outer builder out and back; each keeps its own inline copy storage in
+// place, since queued cursors point into it.
+struct rpc_write_builder {
+  int write_id;
+  int write_op;
+  int32_t write_stream_id;
+  uint64_t write_dependency;
+  uint64_t write_ticket;
+  bool write_awaited;
+  rpc_request_scope write_scope;
+  std::vector<rpc_write_cursor> write_queue;
+  unsigned char *write_copy_buffer;
+  size_t write_copy_capacity;
+  size_t write_copy_offset;
+};
+
+struct conn_t : rpc_write_builder {
+  lupine_socket_t connfd;
+
+  int request_id;
+
+  pthread_t read_thread;
+  pthread_mutex_t write_mutex, call_mutex, async_mutex;
+  pthread_cond_t async_cond;
+  uint64_t issued_async_sequence; // tickets sent, under write_mutex
+  uint64_t serving_async_sequence;
+  int async_waiters = 0; // lanes in a ticket wait, under async_mutex
+  // Entry i: ticket serving_async_sequence + i has completed. Under
+  // async_mutex.
+  std::deque<bool> completed_async_sequences;
+  // Scope state, under write_mutex.
+  std::unordered_map<uintptr_t, rpc_scope_ticket> scope_last;
+  std::vector<rpc_scope_ticket> retired_scopes;
+  rpc_scope_ticket connection_last;
+  rpc_scope_ticket host_writes_last;
+  bool async_cancelled;
+  int async_sync_initialized;
+  int first_async_error;
+  std::vector<rpc_host_allocation_write> host_allocation_writes;
+  int host_allocation_writes_pending;
+  // Whether a host-memory flush was sent unanswered since a callback's
+  // acknowledgement last waited for the flushes.
+  int host_flushes_unsettled;
+  alignas(std::max_align_t) unsigned char write_copy_inline[256];
+  int local_request_parity;
+  int logical_index;
+  int closed;
+  void *http2;
+  void *tls_session; // SSL* for https:// client connections; otherwise null.
+  // The backend's pushed device-to-host delivery state, created on first use.
+  void *dtoh_push;
+  uintptr_t va_base;
+  size_t va_size;
+  uintptr_t va_next;
+  intptr_t w_offset;
+};
+
+// The backend's device-to-host delivery state for `conn` (conn->dtoh_push),
+// created by whichever thread needs it first and never freed. `init` runs on a
+// new state before it is published.
+template <typename T>
+T *rpc_dtoh_state(conn_t *conn, void (*init)(T *, conn_t *) = nullptr) {
+  void *state = __atomic_load_n(&conn->dtoh_push, __ATOMIC_ACQUIRE);
+  if (state == nullptr) {
+    T *created = new T();
+    if (init != nullptr) {
+      init(created, conn);
+    }
+    if (__atomic_compare_exchange_n(&conn->dtoh_push, &state, created, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      return created;
+    }
+    delete created;
+  }
+  return static_cast<T *>(state);
+}
+
+static inline bool lupine_va_contains(const conn_t *conn, uintptr_t address,
+                                      size_t size) {
+  return conn != nullptr && conn->va_size != 0 && size <= conn->va_size &&
+         address >= conn->va_base &&
+         address - conn->va_base <= conn->va_size - size;
+}
+
+// Returns 0 with an arena reserved, 1 when unsupported on this platform, and
+// -1 when no candidate remains. min_slot skips ranges rejected by the peer, and
+// window is the range the peer said it can host.
+extern int lupine_va_reserve_client(conn_t *conn,
+                                    const lupine_va_window &window,
+                                    unsigned int min_slot, unsigned int *slot);
+extern int lupine_va_reserve_server(conn_t *conn, uintptr_t base, size_t size);
+// Releases a rejected candidate without disturbing the connection transport.
+extern void lupine_va_release(conn_t *conn);
+// Bump-claims an aligned span inside the connection's arena. Concurrent callers
+// each get a disjoint span; false means the arena cannot fit the request.
+extern bool lupine_va_claim(conn_t *conn, size_t size, size_t alignment,
+                            uintptr_t *claimed);
+
+// Backends install these hooks before opening connections. They let the
+// transport report lifecycle changes without depending on backend state.
+// Installation is process-local and succeeds at most once per RPC core.
+struct rpc_lifecycle_hooks {
+  void (*connection_closed)(conn_t *conn);
+  void (*thread_lane_destroyed)(uint64_t lane_id);
+  // Runs on the RPC caller after a complete response has been consumed.
+  void (*response_completed)(conn_t *conn, int32_t stream_id);
+  // Whether an alias-backed response destination needs write protection.
+  // Without a backend hook, preserve the protected read-view behavior.
+  bool (*host_range_is_protected)(uintptr_t start, size_t size) = nullptr;
+};
+extern int rpc_set_lifecycle_hooks(const rpc_lifecycle_hooks *hooks);
+
+extern int rpc_dispatch(conn_t *conn, int parity);
+// Binds the calling thread to a peer-created HTTP/2 lane. Server lane workers
+// use this before rpc_dispatch; the stream id is the lane identity.
+extern int rpc_bind_http2_stream(conn_t *conn, int32_t stream_id);
+extern void rpc_unbind_http2_stream(conn_t *conn);
+extern int32_t rpc_current_http2_stream(conn_t *conn);
+extern int rpc_read_start(conn_t *conn, int write_id);
+extern int rpc_read(conn_t *conn, void *data, size_t size);
+// A read into a host allocation's client view lands through its writable
+// alias, then is recorded so the view is refreshed before it is next used.
+extern void *rpc_host_allocation_alias(conn_t *conn, void *data, size_t size);
+extern int rpc_note_host_allocation_write(conn_t *conn, void *data,
+                                          size_t written);
+extern int rpc_drain(conn_t *conn, size_t size);
+extern int rpc_read_end(conn_t *conn);
+
+// Sends the request being built and waits for its answer.
+extern int rpc_wait_for_response(conn_t *conn);
+// Marks the request being built as one whose answer the caller reads itself,
+// after rpc_write_end, with rpc_read_start.
+extern void rpc_expect_answer(conn_t *conn);
+
+// Owns connection validation for the request chain: a null conn (route with no
+// remote server) or a closed conn fails here, so callers surface their
+// unavailable-server result without per-call-site null checks. The request
+// is ordered by the object `key` names, with RPC_REQUEST_* `flags`;
+// rpc_write_start_request orders it behind every earlier unanswered request.
+extern int rpc_write_start_request_on(conn_t *conn, const int op, uintptr_t key,
+                                      unsigned flags = 0);
+// OLGP semantic transport: independent kernel launches may be pipelined
+// instead of ordered behind every earlier unanswered request.
+static inline bool olgp_independent_rpc(const int op) {
+  return op == RPC_cuLaunchKernel || op == RPC_cuLaunchKernelEx;
+}
+static inline int rpc_write_start_request(conn_t *conn, const int op) {
+  const uintptr_t scope = olgp_independent_rpc(op) ? RPC_SCOPE_NONE : RPC_SCOPE_ALL;
+  return rpc_write_start_request_on(conn, op, scope);
+}
+// Adds a second object the request being built is ordered by.
+extern int rpc_request_on(conn_t *conn, uintptr_t key);
+// Orders the request being built behind an object's earlier requests without
+// later requests on that object ordering behind it.
+extern int rpc_request_after(conn_t *conn, uintptr_t key);
+// Brackets the requests a client sends while answering a server callback,
+// after it has read the callback's request: they belong to the callback, so a
+// handoff that pauses new requests lets them through.
+extern void rpc_begin_callback_reply(conn_t *conn);
+extern void rpc_end_callback_reply();
+extern int rpc_write_start_response(conn_t *conn, const int read_id);
+// A zero-size write is a successful no-op, including when data is null.
+extern int rpc_write(conn_t *conn, const void *data, const size_t size);
+// Pitched transfers move `slices` * `rows` rows of `width` bytes; rows sit
+// `row_stride` bytes apart and slices `slice_stride` bytes apart at this
+// endpoint. The wire carries the rows back-to-back, identical to a contiguous
+// transfer of width * rows * slices bytes. A flat 2D region is one slice.
+extern int rpc_write_pitched(conn_t *conn, const void *data, size_t width,
+                             size_t rows, size_t row_stride, size_t slices,
+                             size_t slice_stride);
+extern int rpc_read_pitched(conn_t *conn, void *data, size_t width, size_t rows,
+                            size_t row_stride, size_t slices,
+                            size_t slice_stride);
+// Reserves the request-owned storage used by subsequent rpc_write_buffer
+// calls. The reservation must be made once before the first buffered write in
+// an RPC and is released with the request.
+extern int rpc_copy_alloc(conn_t *conn, const size_t size);
+// Returns and queues the next aligned span in the request-owned allocation.
+// The complete allocation is fixed before serialization starts, so returned
+// pointers remain valid until the request ends.
+extern void *rpc_write_buffer(conn_t *conn, size_t size, size_t alignment);
+extern int rpc_write_cursors(conn_t *conn, const rpc_write_cursor *cursors,
+                             size_t count);
+extern int rpc_write_end(conn_t *conn);
+// Wait for all fire-and-forget calls published before an RPC's entry, or with
+// `exact` only for ticket `value`. These waits order native submission, not GPU
+// completion; overlapping calls remain free to execute and complete in either
+// order.
+extern int rpc_async_sequence_wait(conn_t *conn, uint64_t value,
+                                   bool exact = false);
+extern void rpc_cancel_async_waits(conn_t *conn);
+// Dispatch claims a request's ticket before its handler runs, and the lane loop
+// releases it once the handler returns, so later requests wait for the call's
+// submission. A handler may release it earlier, once its work is queued, with
+// rpc_async_sequence_end, which is a no-op when nothing is claimed. No
+// execution lock is held meanwhile.
+extern int rpc_async_sequence_begin(conn_t *conn, uint64_t sequence);
+extern void rpc_async_sequence_end(conn_t *conn);
+// Whether the client waits for the answer to the request being handled. A
+// request it does not wait for carries a ticket and gets no answer: its
+// handler keeps a failure for the client's next synchronize instead.
+extern bool rpc_request_awaited(conn_t *conn);
+// Drops what is known about `key`, once nothing sent later can be ordered by
+// it: a destroyed object, or one a later request now stands for. Called
+// outside a request builder.
+extern void rpc_scope_forget(conn_t *conn, uintptr_t key);
+// Moves `key`'s last ticket into `conn`'s retired set and drops `key`, so a
+// recycled handle starts clean while later legacy requests still wait for
+// `key`'s final work until a ticketed legacy request covers it.
+extern void rpc_scope_retire(conn_t *conn, uintptr_t key);
+extern int rpc_request_after_retired(conn_t *conn);
+// The last ticket another lane sent on `key`, for a request being built to
+// carry and the server to check with rpc_async_ticket_released; ~0 if none.
+extern uint64_t rpc_request_pending_ticket(conn_t *conn, uintptr_t key);
+extern bool rpc_async_ticket_released(conn_t *conn, uint64_t ticket);
+// Whether something a soft request is ordered behind has not been submitted.
+extern bool rpc_request_unsettled(conn_t *conn);
+extern int rpc_write_lane_termination(conn_t *conn, uint64_t lane_id);
+// Signals transport readers to stop without releasing connection resources.
+// Owners use this before joining workers that may be blocked on the transport.
+extern void rpc_shutdown_transport_socket(conn_t *conn);
+// Marks a connection closed and atomically takes ownership of its transport
+// socket before aborting it. Safe after a transport error has already set
+// conn->closed, and safe for concurrent/idempotent cleanup.
+extern void rpc_close_transport_socket(conn_t *conn);
+extern void rpc_conn_init(conn_t *conn, lupine_socket_t connfd, int request_id);
+extern void rpc_conn_destroy(conn_t *conn);
+
+// lupine_tcp_connect resolves host:port and returns a connected socket with
+// the standard transport options applied (TCP_NODELAY + keepalive; see
+// lupine_socket_apply_transport_options). A server that is not reachable yet
+// (e.g. still provisioning) is retried up to max_retries times with
+// exponential backoff and bounded attempts. Passing zero preserves the
+// client's single blocking attempt. `dialing`, when given, is handed each
+// socket once its connect is underway so a concurrent shutdown() can abort it
+// (returning false abandons the dial), and LUPINE_INVALID_SOCKET before a
+// socket it was handed is closed. Returns the socket, or
+// LUPINE_INVALID_SOCKET on permanent failure.
+extern lupine_socket_t lupine_tcp_connect(
+    const char *host, const char *port, unsigned int max_retries = 5,
+    const std::function<bool(lupine_socket_t)> &dialing = nullptr);
+
+// Per-connection adaptive polling: grow after a short miss, retain successful
+// budgets, and decay after long idle waits. The 32 us ceiling bounds each idle
+// spin; it is not the target spin time.
+class h2_writer_poll_policy {
+  std::chrono::nanoseconds budget_{0};
+
+public:
+  std::chrono::nanoseconds budget() const { return budget_; }
+
+  // Use the first output arrival, including arrivals after sleeping, rather
+  // than the time the writer is scheduled again. Ignore spurious wakeups.
+  void observe(std::chrono::nanoseconds idle_time);
+};
+
+constexpr int LUPINE_RPC_HTTP2_STREAM_END = -2;
+constexpr int LUPINE_RPC_HTTP2_VA_CONFLICT = -3;
+// The selected native client object no longer matches the server. Retrying an
+// arena slot cannot help; the launcher must fetch the advertised bundle.
+constexpr int LUPINE_RPC_HTTP2_CLIENT_MISMATCH = -4;
+// 0 once all `size` bytes arrived, else LUPINE_RPC_HTTP2_STREAM_END or -1.
+// With `ahead`, also takes up to *ahead already staged bytes into data + size
+// and sets *ahead to how many it took; it never waits for them.
+extern int rpc_http2_read_stream(conn_t *conn, int32_t stream_id, void *data,
+                                 size_t size, size_t *ahead = nullptr);
+extern int rpc_http2_write_stream(conn_t *conn, int32_t stream_id,
+                                  rpc_write_cursor *cursors, size_t count);
+extern int32_t rpc_http2_dispatch_stream(conn_t *conn);
+extern int32_t rpc_http2_lane_stream(conn_t *conn, uint64_t lane_id);
+extern int rpc_http2_end_stream(conn_t *conn, int32_t stream_id);
+extern int32_t rpc_http2_accept_stream(conn_t *conn);
+extern int rpc_http2_client_init(conn_t *conn);
+// Sends another arena preflight on the existing HTTP/2 connection and waits
+// for its result.
+extern int rpc_http2_client_retry_handshake(conn_t *conn);
+// Waits for the peer's response headers on the session's own connection and
+// settles the client-bundle check and, when one was requested, the arena
+// verdict. rpc_http2_client_init already does this when an arena was requested;
+// callers that requested none run it themselves, and a caller with no live peer
+// skips it. Returns 0, LUPINE_RPC_HTTP2_VA_CONFLICT, or
+// LUPINE_RPC_HTTP2_CLIENT_MISMATCH.
+extern int rpc_http2_client_await_ready(conn_t *conn);
+extern void rpc_http2_client_start_heartbeat(conn_t *conn);
+// Stop receiving and wake RPC waiters without closing the socket. Queued
+// output is drained when the transport is destroyed.
+extern void rpc_http2_shutdown(conn_t *conn);
+extern void rpc_http2_destroy(conn_t *conn);
+struct lupine_client_bundle_registry;
+struct rpc_http2_server_metadata {
+  const char *backend_version = nullptr;
+  const lupine_client_bundle_registry *client_bundles = nullptr;
+  const char *bulk_token = nullptr;
+};
+// The server routes extra TCP connections that open with the bulk preamble
+// into the session named by the token it handed out in its handshake response.
+// A bulk connection opens with this magic and the 32-hex-digit session token,
+// then continues as an ordinary HTTP/2 RPC connection.
+constexpr char LUPINE_BULK_PREAMBLE_MAGIC[] = "LUPBULK\n";
+constexpr size_t LUPINE_BULK_PREAMBLE_MAGIC_BYTES = 8;
+constexpr size_t LUPINE_BULK_PREAMBLE_BYTES =
+    LUPINE_BULK_PREAMBLE_MAGIC_BYTES + 32;
+// Sends HEAD / and returns the backend-version response header, or nullptr
+// when the request fails or the server does not advertise a version.
+// The returned pointer remains valid until rpc_http2_destroy() or
+// rpc_conn_destroy(); the probe connection must not be reused for RPC.
+extern const char *rpc_http2_client_probe(conn_t *conn);
+// The bulk-connection token the server handed out, or nullptr. Valid until
+// rpc_http2_destroy().
+extern const char *rpc_http2_peer_bulk_token(conn_t *conn);
+// The arena window the peer stated it can host. False when it stated none.
+extern bool rpc_http2_peer_va_window(conn_t *conn, lupine_va_window *window);
+// Returns -1 on failure, 0 for an RPC connection, and a positive value when
+// the HTTP layer has already handled the request.
+extern int
+rpc_http2_server_init_with_metadata(conn_t *conn,
+                                    const rpc_http2_server_metadata *metadata);
+// Finishes an HTTP-handled connection with GOAWAY and waits for a PING
+// acknowledgement, ensuring the response reached the peer before the server's
+// abortive transport cleanup can reset the socket.
+extern int rpc_http2_server_graceful_shutdown(conn_t *conn);
+// Returns the x-lupine-session request header after the server has consumed
+// the HTTP/2 request headers, or nullptr when no session was supplied.
+extern const char *rpc_http2_session_id(conn_t *conn);
+
+// Keeps the client-to-server TCP path active while a synchronous RPC waits for
+// its response. The heartbeat is transport-only: it emits HTTP/2 PING frames
+// and does not add, combine, or otherwise change application RPCs.
+extern void rpc_http2_response_wait_begin(conn_t *conn);
+extern void rpc_http2_response_wait_end(conn_t *conn);
+
+// Small inline scratch storage with malloc/calloc fallback for RPC marshalling.
+template <size_t InlineBytes = 256> struct lupine_scratch_buffer {
+  static_assert(InlineBytes > 0, "InlineBytes must be non-zero");
+  alignas(std::max_align_t) unsigned char inline_bytes[InlineBytes];
+  void *heap = nullptr;
+  lupine_scratch_buffer() = default;
+  lupine_scratch_buffer(const lupine_scratch_buffer &) = delete;
+  lupine_scratch_buffer &operator=(const lupine_scratch_buffer &) = delete;
+  ~lupine_scratch_buffer() { std::free(heap); }
+
+  template <typename Ptr>
+  bool alloc_into(Ptr &out, size_t count, size_t elem_size = 1,
+                  bool zeroed = false) {
+    if (elem_size != 0 && count > (~size_t{0} - 1) / elem_size)
+      return (out = nullptr), false;
+    size_t bytes = count * elem_size, n = bytes + 1;
+    void *p = InlineBytes >= n
+                  ? (zeroed ? std::memset(inline_bytes, 0, n)
+                            : static_cast<void *>(inline_bytes))
+                  : (std::free(heap),
+                     heap = zeroed ? std::calloc(n, 1) : std::malloc(n));
+    if (p != nullptr && !zeroed)
+      static_cast<unsigned char *>(p)[bytes] = 0;
+    out = reinterpret_cast<Ptr>(p);
+    return p != nullptr;
+  }
+
+  template <typename Ptr>
+  int read_array(conn_t *conn, Ptr &out, size_t count, size_t elem_size = 1,
+                 bool zeroed = false) {
+    return !alloc_into(out, count, elem_size, zeroed) ||
+                   (count * elem_size != 0 &&
+                    rpc_read(
+                        conn,
+                        const_cast<void *>(reinterpret_cast<const void *>(out)),
+                        count * elem_size) < 0)
+               ? -1
+               : 0;
+  }
+
+  template <typename Ptr>
+  int read_into(conn_t *conn, Ptr &out, size_t count, size_t elem_size = 1,
+                bool cstr = false) {
+    if (count == 0)
+      return (out = nullptr), 0;
+    if (read_array(conn, out, count, elem_size, false) < 0)
+      return -1;
+    if (cstr)
+      const_cast<char *>(reinterpret_cast<const char *>(out))[count - 1] = '\0';
+    return 0;
+  }
+};
+
+#endif

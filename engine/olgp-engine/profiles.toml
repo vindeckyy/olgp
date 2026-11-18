@@ -1,0 +1,23 @@
+[small]
+repo_id = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
+filename_glob = "*Q4_K_M.gguf"
+engine = "llama.cpp"
+context = 4096
+batch = 512
+min_vram_mib = 1536
+
+[medium]
+repo_id = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
+filename_glob = "*Q4_K_M.gguf"
+engine = "llama.cpp"
+context = 4096
+batch = 512
+min_vram_mib = 2048
+
+[moe]
+repo_id = "Qwen/Qwen1.5-MoE-A2.7B-GGUF"
+filename_glob = "*Q4_K_M.gguf"
+engine = "inferssd"
+context = 4096
+batch = 256
+min_vram_mib = 512

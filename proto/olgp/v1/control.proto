@@ -1,0 +1,32 @@
+syntax = "proto3";
+package olgp.v1;
+
+import "olgp/v1/common.proto";
+
+message PairingRequest {
+  string expected_box_id = 1;
+  string client_name = 2;
+}
+
+message PairingResponse {
+  string token = 1;
+  BoxInfo box = 2;
+}
+
+message CapabilitiesRequest {}
+
+message CapabilitiesResponse {
+  BoxInfo box = 1;
+  bool ready = 2;
+  repeated string models = 3;
+}
+
+message LeaseRequest {
+  Lease lease = 1;
+  uint32 max_latency_ms = 2;
+}
+
+message LeaseResponse {
+  string lease_id = 1;
+  bool granted = 2;
+}

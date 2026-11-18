@@ -1,0 +1,205 @@
+// Regression coverage for the singular and plural managed-memory range
+// attribute APIs. The ACCESSED_BY result is deliberately wider than one value
+// so the RPC cannot accidentally pass by copying only a pointer-sized slot.
+
+#include <cuda.h>
+
+#include <cstdio>
+#include <cstring>
+
+namespace {
+
+int check(CUresult status, const char *operation) {
+  if (status == CUDA_SUCCESS) {
+    return 0;
+  }
+  const char *name = nullptr;
+  cuGetErrorName(status, &name);
+  std::fprintf(stderr, "%s failed: %d (%s)\n", operation,
+               static_cast<int>(status), name == nullptr ? "unknown" : name);
+  return 1;
+}
+
+struct RangeAttributes {
+  int read_mostly = -99;
+  int preferred_location = -99;
+  int accessed_by[3] = {-99, -99, -99};
+  int last_prefetch_location = -99;
+};
+
+} // namespace
+
+int main() {
+  int device_count = 0;
+  CUdevice device = 0;
+  CUcontext context = nullptr;
+  if (check(cuInit(0), "cuInit") != 0 ||
+      check(cuDeviceGetCount(&device_count), "cuDeviceGetCount") != 0 ||
+      device_count == 0 || check(cuDeviceGet(&device, 0), "cuDeviceGet") != 0 ||
+      check(cuDevicePrimaryCtxRetain(&context, device),
+            "cuDevicePrimaryCtxRetain") != 0 ||
+      check(cuCtxSetCurrent(context), "cuCtxSetCurrent") != 0) {
+    return 1;
+  }
+
+  constexpr size_t allocation_size = 4096;
+  CUdeviceptr allocation = 0;
+  if (check(
+          cuMemAllocManaged(&allocation, allocation_size, CU_MEM_ATTACH_GLOBAL),
+          "cuMemAllocManaged") != 0) {
+    cuDevicePrimaryCtxRelease(device);
+    return 2;
+  }
+
+  auto advise = [&](CUmem_advise hint, CUdevice target) {
+#if CUDA_VERSION >= 12020
+    CUmemLocation location = {};
+    location.type = target == CU_DEVICE_CPU ? CU_MEM_LOCATION_TYPE_HOST
+                                            : CU_MEM_LOCATION_TYPE_DEVICE;
+    location.id = target == CU_DEVICE_CPU ? 0 : target;
+    return cuMemAdvise_v2(allocation, allocation_size, hint, location);
+#else
+    return cuMemAdvise(allocation, allocation_size, hint, target);
+#endif
+  };
+  if (check(advise(CU_MEM_ADVISE_SET_READ_MOSTLY, device),
+            "read-mostly advice") ||
+      check(advise(CU_MEM_ADVISE_SET_PREFERRED_LOCATION, CU_DEVICE_CPU),
+            "preferred-location advice") ||
+      check(advise(CU_MEM_ADVISE_SET_ACCESSED_BY, CU_DEVICE_CPU),
+            "CPU access advice") ||
+      check(advise(CU_MEM_ADVISE_SET_ACCESSED_BY, device),
+            "GPU access advice")) {
+    cuMemFree(allocation);
+    cuDevicePrimaryCtxRelease(device);
+    return 7;
+  }
+
+  CUmem_range_attribute attributes[] = {
+      CU_MEM_RANGE_ATTRIBUTE_READ_MOSTLY,
+      CU_MEM_RANGE_ATTRIBUTE_PREFERRED_LOCATION,
+      CU_MEM_RANGE_ATTRIBUTE_ACCESSED_BY,
+      CU_MEM_RANGE_ATTRIBUTE_LAST_PREFETCH_LOCATION,
+  };
+  constexpr size_t attribute_count = sizeof(attributes) / sizeof(attributes[0]);
+  size_t data_sizes[] = {sizeof(int), sizeof(int), 3 * sizeof(int),
+                         sizeof(int)};
+
+  RangeAttributes individual;
+  void *individual_data[] = {
+      &individual.read_mostly,
+      &individual.preferred_location,
+      individual.accessed_by,
+      &individual.last_prefetch_location,
+  };
+  for (size_t i = 0; i < attribute_count; ++i) {
+    if (check(cuMemRangeGetAttribute(individual_data[i], data_sizes[i],
+                                     attributes[i], allocation,
+                                     allocation_size),
+              "cuMemRangeGetAttribute") != 0) {
+      cuMemFree(allocation);
+      cuDevicePrimaryCtxRelease(device);
+      return 3;
+    }
+  }
+
+  if (individual.read_mostly != 1 ||
+      individual.preferred_location != CU_DEVICE_CPU ||
+      individual.accessed_by[0] != device ||
+      individual.accessed_by[1] != CU_DEVICE_CPU ||
+      individual.accessed_by[2] != CU_DEVICE_INVALID) {
+    std::fprintf(stderr, "managed-memory advice was not retained\n");
+    cuMemFree(allocation);
+    cuDevicePrimaryCtxRelease(device);
+    return 8;
+  }
+
+  RangeAttributes plural;
+  void *plural_data[] = {
+      &plural.read_mostly,
+      &plural.preferred_location,
+      plural.accessed_by,
+      &plural.last_prefetch_location,
+  };
+  if (check(cuMemRangeGetAttributes(plural_data, data_sizes, attributes,
+                                    attribute_count, allocation,
+                                    allocation_size),
+            "cuMemRangeGetAttributes") != 0) {
+    cuMemFree(allocation);
+    cuDevicePrimaryCtxRelease(device);
+    return 4;
+  }
+
+  for (size_t i = 0; i < attribute_count; ++i) {
+    if (std::memcmp(individual_data[i], plural_data[i], data_sizes[i]) != 0) {
+      std::fprintf(stderr,
+                   "attribute %zu differs between singular and plural "
+                   "queries\n",
+                   i);
+      cuMemFree(allocation);
+      cuDevicePrimaryCtxRelease(device);
+      return 5;
+    }
+  }
+
+  // Verify null/invalid argument handling and output preservation on error.
+  int sentinel = 0x13572468;
+  if (cuMemRangeGetAttribute(nullptr, sizeof(int),
+                             CU_MEM_RANGE_ATTRIBUTE_READ_MOSTLY, allocation,
+                             allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      cuMemRangeGetAttribute(&sentinel, 0, CU_MEM_RANGE_ATTRIBUTE_READ_MOSTLY,
+                             allocation,
+                             allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      cuMemRangeGetAttribute(
+          &sentinel, sizeof(int), static_cast<CUmem_range_attribute>(999),
+          allocation, allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      sentinel != 0x13572468) {
+    std::fprintf(stderr, "cuMemRangeGetAttribute invalid-arg check failed\n");
+    cuMemFree(allocation);
+    cuDevicePrimaryCtxRelease(device);
+    return 9;
+  }
+
+  int first_out = 0x24681357;
+  int second_out = 0x13572468;
+  void *pair_data_null[] = {&first_out, nullptr};
+  void *pair_data[] = {&first_out, &second_out};
+  size_t pair_sizes[] = {sizeof(int), sizeof(int)};
+  size_t bad_sizes[] = {sizeof(int), 1};
+  CUmem_range_attribute pair_attrs[] = {
+      CU_MEM_RANGE_ATTRIBUTE_READ_MOSTLY,
+      CU_MEM_RANGE_ATTRIBUTE_PREFERRED_LOCATION,
+  };
+  if (cuMemRangeGetAttributes(nullptr, pair_sizes, pair_attrs, 2, allocation,
+                              allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      cuMemRangeGetAttributes(pair_data, nullptr, pair_attrs, 2, allocation,
+                              allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      cuMemRangeGetAttributes(pair_data, pair_sizes, nullptr, 2, allocation,
+                              allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      cuMemRangeGetAttributes(pair_data, pair_sizes, pair_attrs, 0, allocation,
+                              allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      cuMemRangeGetAttributes(pair_data_null, pair_sizes, pair_attrs, 2,
+                              allocation,
+                              allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      cuMemRangeGetAttributes(pair_data, bad_sizes, pair_attrs, 2, allocation,
+                              allocation_size) != CUDA_ERROR_INVALID_VALUE ||
+      first_out != 0x24681357 || second_out != 0x13572468) {
+    std::fprintf(stderr, "cuMemRangeGetAttributes invalid-arg check failed\n");
+    cuMemFree(allocation);
+    cuDevicePrimaryCtxRelease(device);
+    return 10;
+  }
+
+  if (check(cuMemFree(allocation), "cuMemFree") != 0 ||
+      check(cuDevicePrimaryCtxRelease(device), "cuDevicePrimaryCtxRelease") !=
+          0) {
+    return 6;
+  }
+
+  std::printf("managed-memory range attributes match (%d, %d, [%d, %d, %d], "
+              "%d)\n",
+              individual.read_mostly, individual.preferred_location,
+              individual.accessed_by[0], individual.accessed_by[1],
+              individual.accessed_by[2], individual.last_prefetch_location);
+  return 0;
+}

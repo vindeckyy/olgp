@@ -1,0 +1,9 @@
+Open Local GPU Protocol (OLGP)
+Copyright 2026 OLGP contributors
+
+This product includes software developed in the Lumen project, dual-licensed
+MIT OR Apache-2.0, at ./third_party/lumen-crypto and ./third_party/lumen-transport.
+
+This product includes LUPINE, Apache-2.0, at ./third_party/lupine.
+This product includes InferSSD, Apache-2.0, at ./third_party/inferssd.
+See THIRD_PARTY.md for exact revisions and license files.

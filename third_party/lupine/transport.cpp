@@ -1,0 +1,862 @@
+#include "transport.h"
+#include "process_handoff.h"
+
+#include "lupine_log.h"
+#include "monitoring.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+#include <vector>
+#include <fstream>
+#include <string>
+#ifdef LUPINE_TLS_OPENSSL
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+#include <openssl/x509.h>
+#endif
+
+#ifdef LUPINE_TLS_OPENSSL
+#include <openssl/ssl.h>
+#endif
+
+// OLGP patch: the active box is selected system-wide by /etc/olgp/active-box.json.
+// The file is intentionally simple JSON; only two string fields are needed here.
+std::string olgp_read_json_string(const char *path, const char *key) {
+  std::ifstream input(path);
+  if (!input) {
+    return {};
+  }
+  const std::string needle = std::string("\"") + key + "\"";
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto at = line.find(needle);
+    if (at == std::string::npos) {
+      continue;
+    }
+    const auto colon = line.find(':', at + needle.size());
+    const auto first = line.find('"', colon == std::string::npos ? at : colon);
+    if (first == std::string::npos) {
+      continue;
+    }
+    const auto second = line.find('"', first + 1);
+    if (second == std::string::npos) {
+      continue;
+    }
+    return line.substr(first + 1, second - first - 1);
+  }
+  return {};
+}
+
+std::string olgp_active_endpoint() {
+  return olgp_read_json_string("/etc/olgp/active-box.json", "rpc_url");
+}
+
+#ifdef LUPINE_TLS_OPENSSL
+std::string olgp_hex(const unsigned char *bytes, size_t length) {
+  static constexpr char kDigits[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(length * 2);
+  for (size_t i = 0; i < length; ++i) {
+    out.push_back(kDigits[bytes[i] >> 4]);
+    out.push_back(kDigits[bytes[i] & 15]);
+  }
+  return out;
+}
+
+bool olgp_verify_spki_pin(SSL *session) {
+  const std::string expected =
+      olgp_read_json_string("/etc/olgp/active-box.json", "spki_sha256");
+  if (expected.empty()) {
+    return true;
+  }
+  X509 *certificate = SSL_get_peer_certificate(session);
+  if (certificate == nullptr) {
+    return false;
+  }
+  EVP_PKEY *public_key = X509_get_pubkey(certificate);
+  X509_free(certificate);
+  if (public_key == nullptr) {
+    return false;
+  }
+  unsigned char *der = nullptr;
+  const int length = i2d_PUBKEY(public_key, &der);
+  EVP_PKEY_free(public_key);
+  if (length <= 0 || der == nullptr) {
+    return false;
+  }
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  SHA256(der, static_cast<size_t>(length), digest);
+  OPENSSL_free(der);
+  return olgp_hex(digest, sizeof(digest)) == expected;
+}
+#endif
+namespace {
+
+constexpr unsigned int kTransportCapacity = 16;
+constexpr unsigned int kBoundedRetryCount = 5;
+constexpr const char *kDefaultPort = "14833";
+
+struct client_transport_state {
+  lupine_client_transport_config config;
+  pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t teardown_cv = PTHREAD_COND_INITIALIZER;
+  std::array<conn_t, kTransportCapacity> connections = {};
+  std::array<lupine_client_endpoint, kTransportCapacity> endpoints;
+  std::array<lupine_bulk_lanes, kTransportCapacity> bulk = {};
+  std::array<bool, kTransportCapacity> bulk_dialed = {};
+  std::array<std::thread, kTransportCapacity> checkpoint_threads;
+  std::atomic<unsigned int> count{0};
+  std::atomic<bool> shutting_down{false};
+};
+
+client_transport_state &transport() {
+  static auto *state = new client_transport_state;
+  return *state;
+}
+
+bool endpoint_has_invalid_scheme(const std::string &endpoint) {
+  return endpoint.find("://") != std::string::npos ||
+         endpoint.compare(0, 5, "http:") == 0 ||
+         endpoint.compare(0, 6, "https:") == 0;
+}
+
+int parse_endpoints(const char *servers, bool strict,
+                    std::vector<lupine_client_endpoint> *endpoints) {
+  endpoints->clear();
+  const std::string value(servers);
+  size_t begin = 0;
+  while (begin <= value.size()) {
+    size_t comma = value.find(',', begin);
+    std::string token = value.substr(begin, comma - begin);
+    begin = comma == std::string::npos ? value.size() + 1 : comma + 1;
+    if (strict && token.empty()) {
+      continue;
+    }
+
+    lupine_client_endpoint endpoint;
+    endpoint.port = kDefaultPort;
+    if (token.compare(0, 8, "https://") == 0) {
+      endpoint.tls = true;
+      endpoint.port = "443";
+      token.erase(0, 8);
+    } else if (token.compare(0, 7, "http://") == 0) {
+      token.erase(0, 7);
+    } else if (strict && endpoint_has_invalid_scheme(token)) {
+      LUPINE_LOG_ERROR("Invalid LUPINE_SERVER URL scheme: " << token);
+      continue;
+    }
+
+    size_t colon = token.find(':');
+    endpoint.host = token.substr(0, colon);
+    if (colon != std::string::npos) {
+      endpoint.port = token.substr(colon + 1);
+    }
+    if (strict && (endpoint.host.empty() || endpoint.port.empty())) {
+      LUPINE_LOG_ERROR("Invalid LUPINE_SERVER endpoint");
+      continue;
+    }
+    endpoint.label = endpoint.host;
+    if (endpoint.port != kDefaultPort) {
+      endpoint.label += ":" + endpoint.port;
+    }
+    endpoints->push_back(std::move(endpoint));
+  }
+  return endpoints->empty() ? -1 : 0;
+}
+
+#ifdef LUPINE_TLS_OPENSSL
+SSL_CTX *client_tls_context() {
+  static SSL_CTX *context = [] {
+    SSL_CTX *created = SSL_CTX_new(TLS_client_method());
+    if (created != nullptr) {
+      SSL_CTX_set_min_proto_version(created, TLS1_2_VERSION);
+      SSL_CTX_set_default_verify_paths(created);
+#ifdef __APPLE__
+      // Static OpenSSL's default CA path points into Homebrew. Use the OS
+      // trust bundle unless the caller explicitly selected other CA paths.
+      if (std::getenv("SSL_CERT_FILE") == nullptr &&
+          std::getenv("SSL_CERT_DIR") == nullptr) {
+        SSL_CTX_load_verify_locations(created, "/etc/ssl/cert.pem", nullptr);
+      }
+#endif
+      SSL_CTX_set_verify(created, SSL_VERIFY_PEER, nullptr);
+    }
+    return created;
+  }();
+  return context;
+}
+#endif
+
+int initialize_tls(conn_t *conn, const lupine_client_endpoint &endpoint) {
+  if (!endpoint.tls) {
+    return 0;
+  }
+#ifdef LUPINE_TLS_OPENSSL
+  SSL_CTX *context = client_tls_context();
+  SSL *session = context != nullptr ? SSL_new(context) : nullptr;
+  const bool handshake_ok =
+      session != nullptr &&
+      SSL_set_tlsext_host_name(session, endpoint.host.c_str()) == 1 &&
+      SSL_set1_host(session, endpoint.host.c_str()) == 1 &&
+      SSL_set_fd(session, static_cast<int>(conn->connfd)) == 1 &&
+      SSL_connect(session) == 1;
+  if (handshake_ok && olgp_verify_spki_pin(session)) {
+    conn->tls_session = session;
+    return 0;
+  }
+  if (session != nullptr) {
+    SSL_free(session);
+  }
+  LUPINE_LOG_ERROR("TLS handshake with " << endpoint.host << " failed");
+#else
+  LUPINE_LOG_ERROR("LUPINE_SERVER entry "
+                   << endpoint.host << ":" << endpoint.port
+                   << " uses https:// but this client was built without TLS "
+                      "support");
+#endif
+  return -1;
+}
+
+void free_tls(conn_t *conn) {
+#ifdef LUPINE_TLS_OPENSSL
+  if (conn->tls_session != nullptr) {
+    SSL_free(static_cast<SSL *>(conn->tls_session));
+    conn->tls_session = nullptr;
+  }
+#else
+  (void)conn;
+#endif
+}
+
+bool resume_handshake(conn_t *conn, const std::string &checkpoint) {
+  const char *session = getenv("LUPINE_SESSION");
+  if (session == nullptr) {
+    return false;
+  }
+  std::string request = "POST /.well-known/lupine/resume HTTP/1.1\r\n"
+                        "Host: lupine\r\nContent-Length: 0\r\n"
+                        "x-lupine-session: " +
+                        std::string(session) +
+                        "\r\nx-lupine-checkpoint: " + checkpoint + "\r\n\r\n";
+  size_t offset = 0;
+  while (offset < request.size()) {
+    ssize_t written;
+#ifdef LUPINE_TLS_OPENSSL
+    if (conn->tls_session != nullptr) {
+      written = SSL_write(static_cast<SSL *>(conn->tls_session),
+                          request.data() + offset, request.size() - offset);
+    } else
+#endif
+    {
+      struct iovec data = {request.data() + offset, request.size() - offset};
+      written = lupine_socket_sendv(conn->connfd, &data, 1);
+    }
+    if (written <= 0) {
+      return false;
+    }
+    offset += static_cast<size_t>(written);
+  }
+  // Do not consume any bytes from the retained HTTP/2 session following the
+  // HTTP/1 response. The supervisor sends it only after CPU/GPU restoration.
+  std::string response;
+  while (response.size() < 4096) {
+    char byte;
+    ssize_t received;
+#ifdef LUPINE_TLS_OPENSSL
+    if (conn->tls_session != nullptr) {
+      received = SSL_read(static_cast<SSL *>(conn->tls_session), &byte, 1);
+    } else
+#endif
+    {
+      received = lupine_socket_recv(conn->connfd, &byte, 1);
+    }
+    if (received != 1) {
+      return false;
+    }
+    response.push_back(byte);
+    if (response.size() >= 4 &&
+        response.compare(response.size() - 4, 4, "\r\n\r\n") == 0) {
+      constexpr char success[] = "HTTP/1.1 200 ";
+      return response.compare(0, sizeof(success) - 1, success) == 0;
+    }
+  }
+  return false;
+}
+
+bool valid_checkpoint(const std::string &checkpoint) {
+  const char *session = getenv("LUPINE_SESSION");
+  if (session == nullptr || session[0] == '\0' || strchr(session, '\r') ||
+      strchr(session, '\n')) {
+    return false;
+  }
+  std::string prefix = std::string(session) + ".";
+  if (checkpoint.compare(0, prefix.size(), prefix) != 0 ||
+      checkpoint.size() <= prefix.size() || checkpoint[prefix.size()] == '0') {
+    return false;
+  }
+  return checkpoint.find_first_not_of("0123456789", prefix.size()) ==
+         std::string::npos;
+}
+
+bool reconnect_checkpoint(conn_t *conn, const std::string &checkpoint) {
+  auto &state = transport();
+  const auto &endpoint = state.endpoints[conn->logical_index];
+  if (lupine_handoff_park_socket(conn) < 0) {
+    return false;
+  }
+  lupine_client_transport_shutdown_bulk(conn);
+  free_tls(conn);
+  lupine_socket_close(__atomic_exchange_n(&conn->connfd, LUPINE_INVALID_SOCKET,
+                                          __ATOMIC_ACQ_REL));
+  while (!conn->closed) {
+    conn_t replacement = {};
+    // Closing the client must interrupt the dial and then a pending TLS/resume
+    // handshake, so the socket is published to the shutdown path throughout.
+    auto publish = [&](lupine_socket_t socket) {
+      pthread_mutex_lock(&state.mutex);
+      bool closing = state.shutting_down || conn->closed;
+      conn->connfd = closing ? LUPINE_INVALID_SOCKET : socket;
+      pthread_mutex_unlock(&state.mutex);
+      return !closing;
+    };
+    replacement.connfd = lupine_tcp_connect(endpoint.host.c_str(),
+                                            endpoint.port.c_str(), 0, publish);
+    bool closing = !publish(replacement.connfd);
+    if (closing) {
+      if (replacement.connfd != LUPINE_INVALID_SOCKET) {
+        lupine_socket_close(replacement.connfd);
+      }
+      return false;
+    }
+    bool ready = replacement.connfd != LUPINE_INVALID_SOCKET &&
+                 initialize_tls(&replacement, endpoint) == 0 &&
+                 resume_handshake(&replacement, checkpoint);
+    pthread_mutex_lock(&state.mutex);
+    if (ready && !state.shutting_down && !conn->closed) {
+      conn->connfd = replacement.connfd;
+      conn->tls_session = replacement.tls_session;
+      int result = lupine_handoff_resume_socket(conn);
+      pthread_mutex_unlock(&state.mutex);
+      return result == 0;
+    }
+    conn->connfd = LUPINE_INVALID_SOCKET;
+    pthread_mutex_unlock(&state.mutex);
+    free_tls(&replacement);
+    if (replacement.connfd != LUPINE_INVALID_SOCKET) {
+      lupine_socket_close(replacement.connfd);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  }
+  return false;
+}
+
+char receive_checkpoint_control(conn_t *conn, const std::string &checkpoint) {
+  char command;
+  std::string received;
+  if (lupine_handoff_receive_control(conn, &command, &received) < 0 ||
+      received != checkpoint) {
+    return '\0';
+  }
+  return command;
+}
+
+bool checkpoint_handoff(conn_t *conn, const std::string &checkpoint) {
+  if (lupine_handoff_pause_requests(conn) < 0 ||
+      rpc_write_start_request(conn, LUPINE_HANDOFF_DRAIN_REQUEST) < 0 ||
+      rpc_wait_for_response(conn) < 0) {
+    return false;
+  }
+  int result = -1;
+  if (rpc_read(conn, &result, sizeof(result)) < 0 || rpc_read_end(conn) < 0 ||
+      result != 0 || lupine_handoff_send_control(conn, 'D', checkpoint) < 0) {
+    return false;
+  }
+
+  char command = receive_checkpoint_control(conn, checkpoint);
+  if (command == 'X') {
+    return true;
+  }
+  if (command != 'F' ||
+      lupine_handoff_send_control(conn, 'A', checkpoint) < 0) {
+    return false;
+  }
+  command = receive_checkpoint_control(conn, checkpoint);
+  if (command == 'X') {
+    return true;
+  }
+  return command == 'C' && reconnect_checkpoint(conn, checkpoint);
+}
+
+void checkpoint_connection(conn_t *conn) {
+  auto &config = transport().config;
+  char command;
+  std::string checkpoint;
+  while (lupine_handoff_receive_control(conn, &command, &checkpoint) == 0) {
+    if (command != 'P' || !valid_checkpoint(checkpoint)) {
+      break;
+    }
+    if (config.checkpoint_begin != nullptr) {
+      config.checkpoint_begin();
+    }
+    bool resumed = checkpoint_handoff(conn, checkpoint);
+    if (resumed) {
+      lupine_handoff_resume_requests(conn);
+    } else {
+      rpc_shutdown_transport_socket(conn);
+    }
+    if (config.checkpoint_end != nullptr) {
+      config.checkpoint_end();
+    }
+    if (!resumed) {
+      return;
+    }
+  }
+  if (!conn->closed) {
+    rpc_shutdown_transport_socket(conn);
+  }
+}
+
+void reset_connection(conn_t *conn) {
+  rpc_conn_destroy(conn);
+  free_tls(conn);
+  *conn = {};
+  conn->connfd = LUPINE_INVALID_SOCKET;
+}
+
+void *dispatch_connection(void *argument) {
+  auto *conn = static_cast<conn_t *>(argument);
+  auto &state = transport();
+  if (state.config.dispatch != nullptr) {
+    state.config.dispatch(conn);
+  } else {
+    while (!conn->closed && rpc_dispatch(conn, 1) >= 0 &&
+           rpc_read_end(conn) >= 0) {
+    }
+  }
+  lupine_client_transport_close_connection(conn);
+  return nullptr;
+}
+
+int connect_endpoint(client_transport_state &state,
+                     const lupine_client_endpoint &endpoint,
+                     unsigned int index) {
+  conn_t *conn = &state.connections[index];
+  unsigned int min_slot = 0;
+  // Start optimistic with this host's window. A peer that hosts a different one
+  // says so in its response, and the retry below adopts it, so a matching pair
+  // never spends an extra dial to learn what it already assumed.
+  lupine_va_window window = lupine_va_local_window();
+  *conn = {};
+  unsigned int retries =
+      state.config.dial_policy == lupine_client_dial_policy::bounded_retry
+          ? kBoundedRetryCount
+          : 0;
+  lupine_socket_t connfd =
+      lupine_tcp_connect(endpoint.host.c_str(), endpoint.port.c_str(), retries);
+  if (connfd == LUPINE_INVALID_SOCKET) {
+    LUPINE_LOG_ERROR("Connecting to " << endpoint.host << " port "
+                                      << endpoint.port << " failed");
+    return -1;
+  }
+  rpc_conn_init(conn, connfd, 0);
+  conn->logical_index = static_cast<int>(index);
+  conn->w_offset = state.config.w_offset;
+  bool first_handshake = true;
+  for (;;) {
+    unsigned int slot = min_slot;
+    // A server that stated no window hosts no arena at all; the refusal below
+    // reports that rather than spending a dial to be told the same thing.
+    if (conn->w_offset != 0 && window.size != 0) {
+      int reserve_result =
+          lupine_va_reserve_client(conn, window, min_slot, &slot);
+      if (reserve_result < 0) {
+        LUPINE_LOG_ERROR("Reserving a virtual-address arena for "
+                         << endpoint.host << " port " << endpoint.port
+                         << " failed starting at slot " << min_slot);
+        reset_connection(conn);
+        return -1;
+      }
+    }
+    if (first_handshake && initialize_tls(conn, endpoint) < 0) {
+      reset_connection(conn);
+      return -1;
+    }
+    int http2_result = first_handshake ? rpc_http2_client_init(conn)
+                                       : rpc_http2_client_retry_handshake(conn);
+    first_handshake = false;
+    // No arena was requested, so client_init returned without waiting. Settle
+    // the build check on this same connection rather than spending a dial.
+    if (http2_result == 0 && conn->va_size == 0) {
+      http2_result = rpc_http2_client_await_ready(conn);
+    }
+    if (http2_result == LUPINE_RPC_HTTP2_VA_CONFLICT && conn->va_size != 0) {
+      // A refusal means either this slot is taken or the whole window was
+      // wrong. The response carries the peer's window, so adopt it and start
+      // over from its first slot; otherwise step to the next slot in the window
+      // both ends already agree on.
+      lupine_va_window stated = {};
+      bool adopt = rpc_http2_peer_va_window(conn, &stated) &&
+                   (stated.base != window.base || stated.size != window.size);
+      lupine_va_release(conn);
+      if (adopt) {
+        LUPINE_LOG_DEBUG("LUPINE server at " << endpoint.host << " port "
+                                             << endpoint.port
+                                             << " hosts arenas elsewhere; "
+                                                "retrying in its window");
+        window = stated;
+        min_slot = 0;
+        continue;
+      }
+      if (slot + 1 < LUPINE_VA_ARENA_COUNT) {
+        min_slot = slot + 1;
+        continue;
+      }
+    }
+    if (http2_result < 0) {
+      LUPINE_LOG_ERROR("Completing the HTTP/2 handshake with "
+                       << endpoint.host << " port " << endpoint.port
+                       << " failed (result " << http2_result << ")");
+      reset_connection(conn);
+      return -1;
+    }
+    break;
+  }
+
+  state.endpoints[index] = endpoint;
+  if (state.config.connection_kind != nullptr &&
+      lupine_report_client_metadata(conn, state.config.connection_kind) < 0) {
+    LUPINE_LOG_ERROR("Reporting client metadata to "
+                     << endpoint.host << " port " << endpoint.port
+                     << " failed");
+    reset_connection(conn);
+    return -1;
+  }
+  if (state.config.connection_opened != nullptr) {
+    state.config.connection_opened(conn);
+  }
+  if (pthread_create(&conn->read_thread, nullptr, dispatch_connection, conn) !=
+      0) {
+    LUPINE_LOG_ERROR("Starting the RPC dispatch thread for "
+                     << endpoint.host << " port " << endpoint.port
+                     << " failed");
+    reset_connection(conn);
+    return -1;
+  }
+  rpc_http2_client_start_heartbeat(conn);
+  state.checkpoint_threads[index] = std::thread(checkpoint_connection, conn);
+  return 0;
+}
+
+// One bulk connection: the preamble names the session, then an ordinary
+// HTTP/2 handshake without an arena. No dispatch thread or heartbeat: the
+// server never originates requests here and nothing waits for a response.
+bool dial_bulk_connection(const lupine_client_endpoint &endpoint,
+                          const std::string &preamble, unsigned int index,
+                          conn_t **out, int32_t *stream) {
+  lupine_socket_t connfd =
+      lupine_tcp_connect(endpoint.host.c_str(), endpoint.port.c_str(), 0);
+  if (connfd == LUPINE_INVALID_SOCKET) {
+    return false;
+  }
+  size_t sent = 0;
+  while (sent < preamble.size()) {
+    struct iovec buffer = {const_cast<char *>(preamble.data()) + sent,
+                           preamble.size() - sent};
+    ssize_t n = lupine_socket_sendv(connfd, &buffer, 1);
+    if (n < 0 && lupine_socket_error_is_intr()) {
+      continue;
+    }
+    if (n <= 0) {
+      lupine_socket_close(connfd);
+      return false;
+    }
+    sent += static_cast<size_t>(n);
+  }
+  auto *conn = new conn_t();
+  rpc_conn_init(conn, connfd, 0);
+  conn->logical_index = static_cast<int>(index);
+  if (rpc_http2_client_init(conn) < 0 ||
+      rpc_http2_client_await_ready(conn) != 0 ||
+      (*stream = rpc_http2_lane_stream(conn, 0)) < 0) {
+    rpc_conn_destroy(conn);
+    delete conn;
+    return false;
+  }
+  *out = conn;
+  return true;
+}
+
+void dial_bulk_lanes(client_transport_state &state, conn_t *conn,
+                     unsigned int index) {
+  const char *token = rpc_http2_peer_bulk_token(conn);
+  const char *configured = getenv("LUPINE_BULK_CONNECTIONS");
+  char *end = nullptr;
+  long parsed = configured ? strtol(configured, &end, 10) : 4;
+  unsigned int count =
+      configured && (end == configured || *end != '\0') ? 0
+      : parsed <= 0
+          ? 0
+          : static_cast<unsigned int>(std::min(
+                parsed, static_cast<long>(LUPINE_BULK_CONNECTIONS_MAX)));
+  if (token == nullptr || state.endpoints[index].tls || count == 0) {
+    return;
+  }
+  std::string preamble(LUPINE_BULK_PREAMBLE_MAGIC,
+                       LUPINE_BULK_PREAMBLE_MAGIC_BYTES);
+  preamble += token;
+  lupine_bulk_lanes &lanes = state.bulk[index];
+  std::array<std::thread, LUPINE_BULK_CONNECTIONS_MAX> dialers;
+  std::array<bool, LUPINE_BULK_CONNECTIONS_MAX> dialed = {};
+  std::array<conn_t *, LUPINE_BULK_CONNECTIONS_MAX> dialed_conn = {};
+  std::array<int32_t, LUPINE_BULK_CONNECTIONS_MAX> dialed_stream = {};
+  for (unsigned int i = 0; i < count; ++i) {
+    dialers[i] = std::thread([&, i]() {
+      dialed[i] = dial_bulk_connection(state.endpoints[index], preamble, index,
+                                       &dialed_conn[i], &dialed_stream[i]);
+    });
+  }
+  for (unsigned int i = 0; i < count; ++i) {
+    dialers[i].join();
+  }
+  // A partial pool still stripes; the lanes that failed are simply absent.
+  pthread_mutex_lock(&lanes.mutex);
+  for (unsigned int i = 0; i < count; ++i) {
+    if (dialed[i]) {
+      lanes.conn[lanes.count] = dialed_conn[i];
+      lanes.stream[lanes.count] = dialed_stream[i];
+      ++lanes.count;
+    }
+  }
+  if (lanes.failed || conn->closed || state.shutting_down) {
+    lanes.failed = true;
+    for (unsigned int b = 0; b < lanes.count; ++b) {
+      rpc_shutdown_transport_socket(lanes.conn[b]);
+    }
+  }
+  bool empty = lanes.count == 0;
+  pthread_mutex_unlock(&lanes.mutex);
+  if (empty) {
+    LUPINE_LOG_DEBUG("No bulk connections to " << state.endpoints[index].label
+                                               << "; large copies stay on the "
+                                                  "session connection");
+  }
+}
+
+void close_opened_locked(client_transport_state &state, unsigned int count);
+
+} // namespace
+
+lupine_bulk_lanes *lupine_client_transport_bulk_lanes(conn_t *conn) {
+  if (conn == nullptr || conn->logical_index < 0 ||
+      static_cast<unsigned int>(conn->logical_index) >= kTransportCapacity) {
+    return nullptr;
+  }
+  auto &state = transport();
+  if (pthread_mutex_lock(&state.mutex) != 0) {
+    return nullptr;
+  }
+  auto index = static_cast<unsigned int>(conn->logical_index);
+  if (index >= state.count || conn != &state.connections[index]) {
+    pthread_mutex_unlock(&state.mutex);
+    return nullptr;
+  }
+  if (!state.bulk_dialed[index] && !state.shutting_down) {
+    state.bulk_dialed[index] = true;
+    dial_bulk_lanes(state, conn, index);
+  }
+  lupine_bulk_lanes *lanes = &state.bulk[index];
+  pthread_mutex_unlock(&state.mutex);
+  pthread_mutex_lock(&lanes->mutex);
+  bool usable = lanes->count != 0 && !lanes->failed;
+  pthread_mutex_unlock(&lanes->mutex);
+  return usable ? lanes : nullptr;
+}
+
+int lupine_client_transport_open(const lupine_client_transport_config &config,
+                                 const char *servers) {
+  auto &state = transport();
+  if (pthread_mutex_lock(&state.mutex) != 0) {
+    return -1;
+  }
+  while (state.shutting_down) {
+    pthread_cond_wait(&state.teardown_cv, &state.mutex);
+  }
+  if (state.count != 0) {
+    pthread_mutex_unlock(&state.mutex);
+    return 0;
+  }
+  std::string olgp_servers;
+  if (servers == nullptr) {
+    olgp_servers = olgp_active_endpoint();
+    if (!olgp_servers.empty()) {
+      servers = olgp_servers.c_str();
+    }
+  }
+  if (servers == nullptr) {
+    servers = getenv("LUPINE_SERVER");
+  }
+  if (servers == nullptr) {
+    if (config.log_missing_server) {
+      LUPINE_LOG_ERROR("LUPINE_SERVER environment variable not set");
+    }
+    pthread_mutex_unlock(&state.mutex);
+    return -1;
+  }
+
+  std::vector<lupine_client_endpoint> endpoints;
+  if (parse_endpoints(servers, config.strict_endpoints, &endpoints) < 0) {
+    pthread_mutex_unlock(&state.mutex);
+    return -1;
+  }
+  state.config = config;
+  unsigned int opened = 0;
+  for (const auto &endpoint : endpoints) {
+    if (opened == kTransportCapacity) {
+      LUPINE_LOG_ERROR("Too many LUPINE_SERVER entries; ignoring the rest");
+      break;
+    }
+    if (connect_endpoint(state, endpoint, opened) == 0) {
+      ++opened;
+    } else if (config.strict_endpoints) {
+      close_opened_locked(state, opened);
+      return -1;
+    }
+  }
+  if (opened == 0) {
+    state.config = {};
+    pthread_mutex_unlock(&state.mutex);
+    return -1;
+  }
+  state.count = opened;
+  pthread_mutex_unlock(&state.mutex);
+  return 0;
+}
+
+void lupine_client_transport_shutdown_bulk(conn_t *conn) {
+  if (conn == nullptr || conn->logical_index < 0) {
+    return;
+  }
+  auto &state = transport();
+  auto index = static_cast<unsigned int>(conn->logical_index);
+  if (index >= kTransportCapacity || conn != &state.connections[index]) {
+    return;
+  }
+  lupine_bulk_lanes &lanes = state.bulk[index];
+  if (pthread_mutex_lock(&lanes.mutex) != 0) {
+    return;
+  }
+  lanes.failed = true;
+  for (unsigned int b = 0; b < lanes.count; ++b) {
+    rpc_shutdown_transport_socket(lanes.conn[b]);
+  }
+  pthread_mutex_unlock(&lanes.mutex);
+}
+
+void lupine_client_transport_close_connection(conn_t *conn) {
+  if (conn == nullptr) {
+    return;
+  }
+  auto &state = transport();
+  if (state.config.connection_closed != nullptr) {
+    state.config.connection_closed(conn);
+  }
+  lupine_client_transport_shutdown_bulk(conn);
+  rpc_shutdown_transport_socket(conn);
+}
+
+namespace {
+
+void close_opened_locked(client_transport_state &state, unsigned int count) {
+  state.shutting_down = true;
+  state.count = 0;
+  for (unsigned int i = 0; i < count; ++i) {
+    lupine_client_transport_close_connection(&state.connections[i]);
+  }
+  pthread_mutex_unlock(&state.mutex);
+
+  for (unsigned int i = 0; i < count; ++i) {
+    conn_t *conn = &state.connections[i];
+    if (state.checkpoint_threads[i].joinable()) {
+      state.checkpoint_threads[i].join();
+    }
+    if (conn->read_thread != 0) {
+      pthread_join(conn->read_thread, nullptr);
+      conn->read_thread = 0;
+    }
+    lupine_bulk_lanes &lanes = state.bulk[i];
+    pthread_mutex_lock(&lanes.mutex);
+    for (unsigned int b = 0; b < lanes.count; ++b) {
+      rpc_conn_destroy(lanes.conn[b]);
+      delete lanes.conn[b];
+      lanes.conn[b] = nullptr;
+      lanes.stream[b] = 0;
+    }
+    lanes.count = 0;
+    lanes.failed = false;
+    pthread_mutex_unlock(&lanes.mutex);
+    state.bulk_dialed[i] = false;
+    reset_connection(conn);
+    state.endpoints[i] = {};
+  }
+
+  if (pthread_mutex_lock(&state.mutex) == 0) {
+    state.config = {};
+    state.shutting_down = false;
+    pthread_cond_broadcast(&state.teardown_cv);
+    pthread_mutex_unlock(&state.mutex);
+  }
+}
+
+} // namespace
+
+void lupine_client_transport_close() {
+  auto &state = transport();
+  if (pthread_mutex_lock(&state.mutex) != 0) {
+    return;
+  }
+  if (state.shutting_down) {
+    pthread_mutex_unlock(&state.mutex);
+    return;
+  }
+  close_opened_locked(state, state.count);
+}
+
+unsigned int lupine_client_transport_size() { return transport().count; }
+
+conn_t *lupine_client_transport_connection(unsigned int index) {
+  auto &state = transport();
+  return index < state.count ? &state.connections[index] : nullptr;
+}
+
+const lupine_client_endpoint *
+lupine_client_transport_endpoint(unsigned int index) {
+  auto &state = transport();
+  return index < state.count ? &state.endpoints[index] : nullptr;
+}
+
+void lupine_client_transport_retire_lane(uint64_t lane_id) {
+  auto &state = transport();
+  if (pthread_mutex_lock(&state.mutex) != 0) {
+    return;
+  }
+  std::array<conn_t *, kTransportCapacity> active = {};
+  unsigned int count = 0;
+  if (!state.shutting_down) {
+    for (unsigned int i = 0; i < state.count; ++i) {
+      if (!state.connections[i].closed) {
+        active[count++] = &state.connections[i];
+      }
+    }
+  }
+  pthread_mutex_unlock(&state.mutex);
+
+  for (unsigned int i = 0; i < count; ++i) {
+    rpc_write_lane_termination(active[i], lane_id);
+  }
+}

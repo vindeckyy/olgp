@@ -1,0 +1,247 @@
+#pragma once
+
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+#define LUPINE_CUDA_COMPAT_TYPES_ONLY
+#include "cuda_compat.h"
+#undef LUPINE_CUDA_COMPAT_TYPES_ONLY
+
+#include "rpc.h"
+#ifdef __linux__
+#include "device_ioctl_guard.h"
+#endif
+
+static constexpr int LUPINE_ROUTE_REMOTE = 0;
+static constexpr int LUPINE_ROUTE_LOCAL = 1;
+static constexpr int LUPINE_ROUTE_INVALID = 2;
+// A device ordinal outside the virtual device table, as opposed to a route
+// that exists but could not be reached.
+static constexpr int LUPINE_ROUTE_UNKNOWN_DEVICE = 3;
+
+struct lupine_route {
+  int kind = LUPINE_ROUTE_INVALID;
+  conn_t *conn = nullptr;
+};
+
+lupine_route lupine_remote_route_for_conn(conn_t *conn);
+int lupine_route_identity(lupine_route route);
+lupine_route lupine_route_from_identity(int route_id);
+// Only then can a module or library handle be used on a route other than the
+// one that loaded it.
+bool lupine_devices_span_routes();
+CUresult lupine_set_current_context_on_route(lupine_route route, CUcontext ctx);
+bool lupine_local_cuda_available();
+extern "C" CUcontext lupine_current_context_hint();
+CUcontext lupine_default_context_hint_value();
+CUcontext lupine_global_default_context_hint_value();
+void lupine_accept_current_context_hint(CUcontext ctx);
+
+extern "C" lupine_route lupine_route_for_default();
+extern "C" lupine_route lupine_route_for_device(CUdevice *device);
+extern "C" lupine_route lupine_route_for_current_context();
+extern "C" lupine_route lupine_route_for_context(CUcontext ctx);
+extern "C" lupine_route lupine_route_for_module(CUmodule module);
+extern "C" lupine_route lupine_route_for_library(CUlibrary library);
+extern "C" lupine_route lupine_route_for_function(CUfunction function);
+extern "C" lupine_route lupine_route_for_stream(CUstream stream);
+extern "C" lupine_route lupine_route_for_known_stream(CUstream stream);
+extern "C" lupine_route lupine_route_for_event(CUevent event);
+extern "C" lupine_route lupine_route_for_memory_pool(CUmemoryPool pool);
+extern "C" lupine_route lupine_route_for_graph(CUgraph graph);
+extern "C" lupine_route lupine_route_for_graph_node(CUgraphNode node);
+extern "C" lupine_route lupine_route_for_graph_exec(CUgraphExec exec);
+extern "C" lupine_route lupine_route_for_deviceptr(CUdeviceptr ptr);
+// Notes a device-side write to `ptr`: when it names a mapped host allocation,
+// the next synchronize refreshes the client's view of it.
+extern "C" void lupine_note_device_write(CUdeviceptr ptr);
+extern "C" CUcontext lupine_context_for_deviceptr(CUdeviceptr ptr);
+
+extern "C" conn_t *lupine_rpc_conn_for_device(CUdevice *device);
+extern "C" conn_t *lupine_rpc_conn_for_current_context();
+extern "C" conn_t *lupine_rpc_conn_for_event(CUevent event);
+extern "C" conn_t *lupine_rpc_conn_for_deviceptr(CUdeviceptr ptr);
+// Flushes work that must precede the caller's next CUDA RPC without starting
+// that request.
+extern "C" int lupine_prepare_rpc(conn_t *conn);
+
+extern "C" bool lupine_route_is_local(lupine_route route);
+// May return null for local/invalid routes; lupine_prepare_rpc absorbs the
+// null, so callers need not re-check before preparing a request chain.
+extern "C" conn_t *lupine_route_remote_conn(lupine_route route);
+extern "C" bool lupine_routes_share_server(lupine_route first,
+                                           lupine_route second);
+extern "C" bool
+lupine_connection_supports_concurrent_managed_access(conn_t *conn);
+extern "C" bool lupine_deviceptrs_share_route(CUdeviceptr first,
+                                              CUdeviceptr second);
+extern "C" bool lupine_deviceptr_is_tracked(CUdeviceptr ptr);
+
+struct lupine_htod_routing_info {
+  lupine_route dst_route{};
+  bool dst_allocation_covers = false;
+  bool src_deviceptr_tracked = false;
+};
+
+lupine_htod_routing_info
+lupine_query_htod_routing(CUdeviceptr dst, const void *src, size_t bytes);
+extern "C" bool lupine_translate_device_for_conn(conn_t *conn,
+                                                 CUdevice *device);
+extern "C" CUdevice lupine_local_device_for_remote(conn_t *conn,
+                                                   CUdevice remote_device);
+CUdevice lupine_virtual_device_for_route(lupine_route route,
+                                         CUdevice route_device);
+
+// Only DEVICE locations contain virtual CUDA ordinals. Host/NUMA identifiers
+// belong to the selected server and must pass through unchanged.
+static inline CUresult lupine_translate_mem_location(lupine_route route,
+                                                     CUmemLocation &location) {
+  if (location.type != CU_MEM_LOCATION_TYPE_DEVICE) {
+    return CUDA_SUCCESS;
+  }
+  CUdevice device = location.id;
+  lupine_route device_route = lupine_route_for_device(&device);
+  if (device_route.kind == LUPINE_ROUTE_UNKNOWN_DEVICE) {
+    return CUDA_ERROR_INVALID_DEVICE;
+  }
+  if (device_route.kind == LUPINE_ROUTE_INVALID) {
+    return CUDA_ERROR_DEVICE_UNAVAILABLE;
+  }
+  if (!lupine_routes_share_server(route, device_route)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  location.id = device;
+  return CUDA_SUCCESS;
+}
+
+static inline void lupine_restore_mem_location(lupine_route route,
+                                               CUmemLocation &location) {
+  if (location.type == CU_MEM_LOCATION_TYPE_DEVICE) {
+    location.id = lupine_virtual_device_for_route(route, location.id);
+  }
+}
+
+using lupine_device_lookup_callback = CUresult (*)(void *context,
+                                                   lupine_route route,
+                                                   CUdevice *route_device);
+extern "C" CUresult
+lupine_lookup_device_on_all_routes_impl(CUdevice *device, void *context,
+                                        lupine_device_lookup_callback lookup);
+
+template <typename Lookup>
+static CUresult lupine_lookup_device_on_all_routes(CUdevice *device,
+                                                   Lookup lookup) {
+  return lupine_lookup_device_on_all_routes_impl(
+      device, &lookup,
+      [](void *context, lupine_route route, CUdevice *route_device) {
+        return (*static_cast<Lookup *>(context))(route, route_device);
+      });
+}
+
+extern "C" void *lupine_real_cuda_symbol(const char *name);
+
+extern "C" void lupine_note_deviceptr_allocation(CUdeviceptr ptr, size_t size,
+                                                 conn_t *conn);
+extern "C" void lupine_forget_deviceptr_owner(CUdeviceptr ptr);
+extern "C" void lupine_forget_context_owner(CUcontext ctx);
+extern "C" void lupine_mark_context_green(CUcontext ctx);
+extern "C" bool lupine_context_is_green(CUcontext ctx);
+extern "C" void lupine_forget_stream_owner(CUstream stream);
+extern "C" void lupine_retire_stale_fetch_stream(CUstream stream);
+extern "C" void lupine_forget_event_owner(CUevent event);
+
+extern "C" void lupine_note_context_owner_route(CUcontext ctx,
+                                                lupine_route route);
+extern "C" void lupine_note_module_owner_route(CUmodule module,
+                                               lupine_route route);
+extern "C" void lupine_note_library_owner_route(CUlibrary library,
+                                                lupine_route route);
+extern "C" void lupine_note_function_owner_route(CUfunction function,
+                                                 lupine_route route);
+extern "C" void lupine_note_stream_owner_route(CUstream stream,
+                                               lupine_route route);
+extern "C" void lupine_note_event_owner_route(CUevent event,
+                                              lupine_route route);
+extern "C" void lupine_note_memory_pool_owner_route(CUmemoryPool pool,
+                                                    lupine_route route);
+extern "C" void lupine_note_graph_owner_route(CUgraph graph,
+                                              lupine_route route);
+extern "C" void lupine_note_graph_node_owner_route(CUgraphNode node,
+                                                   lupine_route route);
+extern "C" void lupine_note_graph_exec_owner_route(CUgraphExec exec,
+                                                   lupine_route route);
+extern "C" void lupine_note_deviceptr_owner_route(CUdeviceptr ptr,
+                                                  lupine_route route);
+extern "C" void lupine_note_deviceptr_allocation_route(CUdeviceptr ptr,
+                                                       size_t size,
+                                                       lupine_route route);
+// Servers can hand out the same address (the CUDA 13 forward compatibility
+// driver starts every heap at one fixed VA) and pointers route by address.
+// Records *ptr unless another route holds an overlapping allocation; then the
+// colliding block stays allocated until its context goes, and again() asks
+// the same route for another.
+using lupine_disjoint_allocation_callback = CUresult (*)(void *context);
+extern "C" CUresult lupine_record_disjoint_allocation_impl(
+    CUdeviceptr *ptr, size_t size, lupine_route route, void *context,
+    lupine_disjoint_allocation_callback again);
+
+template <typename Again>
+static CUresult lupine_record_disjoint_allocation(CUdeviceptr *ptr, size_t size,
+                                                  lupine_route route,
+                                                  Again again) {
+  return lupine_record_disjoint_allocation_impl(
+      ptr, size, route, &again,
+      [](void *context) { return (*static_cast<Again *>(context))(); });
+}
+
+// Starts a request on `stream`, ordered as CUDA orders that stream's work: a
+// non-blocking stream only by itself; a blocking stream, or the thread's
+// per-thread default stream, also behind the legacy stream; the legacy stream
+// behind every blocking stream. `flags` are rpc.h's RPC_REQUEST_* options.
+// The scope key `stream` names on this thread.
+extern "C" uintptr_t lupine_stream_scope(CUstream stream);
+extern "C" int lupine_rpc_start_on_stream(conn_t *conn, int op, CUstream stream,
+                                          unsigned flags = 0);
+// Orders the request being built by each of `count` handles too, as
+// rpc_request_on does for one.
+extern "C" int lupine_rpc_request_on_each(conn_t *conn,
+                                          const void *const *handles,
+                                          unsigned int count);
+// Records whether a stream this client created waits for the legacy stream.
+extern "C" void lupine_note_stream_blocking(CUstream stream, bool blocking);
+extern "C" void lupine_forget_graph_exec_owner(CUgraphExec exec);
+
+// Resolves a driver entry point once per call site; name must be a literal.
+#define LUPINE_REAL_CUDA_SYMBOL(name)                                          \
+  ([] {                                                                        \
+    static void *const real = lupine_real_cuda_symbol(name);                   \
+    return real;                                                               \
+  }())
+
+template <typename Fn = void,
+          CUresult MissingSymbol = CUDA_ERROR_DEVICE_UNAVAILABLE,
+          typename... Args>
+static CUresult lupine_call_real_cuda_fn(void *symbol, Args &&...args) {
+  using inferred_fn = CUresult(CUDAAPI *)(std::decay_t<Args>...);
+  using real_fn = std::conditional_t<std::is_void_v<Fn>, inferred_fn, Fn>;
+  auto real = reinterpret_cast<real_fn>(symbol);
+#ifdef __linux__
+  lupine_native_cuda_call_guard native_call;
+#endif
+  return real == nullptr ? MissingSymbol : real(std::forward<Args>(args)...);
+}
+
+template <typename Fn = void,
+          CUresult MissingSymbol = CUDA_ERROR_DEVICE_UNAVAILABLE,
+          typename... Args>
+static CUresult lupine_call_real_cuda_fn(const char *name, Args &&...args) {
+  return lupine_call_real_cuda_fn<Fn, MissingSymbol>(
+      lupine_real_cuda_symbol(name), std::forward<Args>(args)...);
+}
+
+template <CUresult MissingSymbol, typename... Args>
+static CUresult lupine_call_real_cuda_fn(const char *name, Args &&...args) {
+  return lupine_call_real_cuda_fn<void, MissingSymbol>(
+      name, std::forward<Args>(args)...);
+}

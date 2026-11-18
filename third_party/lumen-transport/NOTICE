@@ -1,0 +1,3 @@
+Vendored from the Lumen project (https://github.com/vindeckyy/lumen).
+Licensed under MIT OR Apache-2.0. Used as a framing, FEC, pacing, and loss
+estimation reference. OLGP does not include Lumen's remote-desktop pipeline.

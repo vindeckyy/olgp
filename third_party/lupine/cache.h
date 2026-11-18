@@ -1,0 +1,49 @@
+#ifndef LUPINE_CACHE_H
+#define LUPINE_CACHE_H
+
+#include <cuda.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <array>
+
+struct lupine_deviceptr_allocation_record {
+  size_t size = 0;
+  int route_id = -2;
+  CUcontext context = nullptr;
+  uint64_t olgp_handle_id = 0;
+  uint8_t olgp_handle_class = 3;
+  std::array<uint8_t, 32> olgp_content_hash{};
+  uint32_t olgp_generation = 0;
+  uint32_t olgp_refcount = 0;
+};
+
+// The caller holds the routing mutex. Lookup results remain valid until the
+// next allocation cache mutation.
+const lupine_deviceptr_allocation_record *
+lupine_deviceptr_allocation_cache_lookup(CUdeviceptr ptr);
+void lupine_deviceptr_allocation_cache_insert(CUdeviceptr base, size_t size,
+                                             int route_id, CUcontext context);
+void lupine_deviceptr_allocation_cache_erase(CUdeviceptr base);
+bool lupine_deviceptr_allocation_cache_overlaps_other_route(CUdeviceptr base,
+                                                            size_t size,
+                                                            int route_id);
+
+bool lupine_current_context_device_cache_lookup(CUcontext context,
+                                                CUdevice *device);
+void lupine_current_context_device_cache_insert(CUcontext context,
+                                                CUdevice device);
+
+uint64_t lupine_lane_context_cache_epoch();
+bool lupine_lane_context_cache_matches(int route_id, CUcontext context);
+void lupine_lane_context_cache_update(int route_id, CUcontext context,
+                                      uint64_t epoch, bool succeeded);
+
+extern "C" void lupine_invalidate_current_context_cache();
+
+// A driver context set on the lane bound to the calling thread, or a
+// connection coming or going, moves that lane off what this thread believed
+// was current there.
+extern "C" void lupine_note_device_binding_changed();
+
+#endif

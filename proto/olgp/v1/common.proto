@@ -1,0 +1,29 @@
+syntax = "proto3";
+package olgp.v1;
+
+// Capability flags advertised by the box.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+  CAPABILITY_CUDA = 1;
+  CAPABILITY_NVML = 2;
+  CAPABILITY_BATCH = 3;
+  CAPABILITY_TRACE = 4;
+  CAPABILITY_NVME = 5;
+  CAPABILITY_VOICE = 6;
+}
+
+// Stable identity of a box.
+message BoxInfo {
+  string box_id = 1;
+  string spki_sha256 = 2;
+  string gpu = 3;
+  uint32 vram_mib = 4;
+  repeated Capability capabilities = 5;
+}
+
+// Lease classes used by the scheduler.
+enum Lease {
+  LEASE_UNSPECIFIED = 0;
+  LEASE_INTERACTIVE = 1;
+  LEASE_BACKGROUND = 2;
+}

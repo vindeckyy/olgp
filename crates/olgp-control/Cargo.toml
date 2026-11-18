@@ -1,0 +1,23 @@
+[package]
+name = "olgp-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+mdns-sd = { workspace = true }
+lumen-crypto = { path = "../../third_party/lumen-crypto" }
+thiserror = { workspace = true }
+rand = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = { workspace = true }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+[lints]
+workspace = true

@@ -1,0 +1,201 @@
+Codegen works via a human-in-the-loop system. It's quite challenging to build a codegen engine that can correctly
+infer what parameters should be sent and received so we instead have a two-step process.
+
+First, `annotationgen.py` reads an SDK header such as `cuda.h` or `nvml.h` and copies its function signatures
+into that target's annotation file (`annotations_cuda.h`, `annotations_nccl.h`, `annotations_nvml.h`,
+`annotations_hip.h`; one file per shim library). These files are intended to be modified by humans. In particular, the `@param` annotations
+have significant meanings.
+
+Specifically, the order of `@param` annotations indicates the order in which the parameters are sent or received.
+`SEND_ONLY`, `RECV_ONLY`, and `SEND_RECV` indicate the directions the parameter is transferred in. Other arguments
+available are `NULL_TERMINATED` (to indicate that this is a null-terminated string), or `LENGTH:<param>` and
+`SIZE:<value>` to specify the size (aka width) of the parameter. If `LENGTH:<param>` is specified, `<param>` must
+be placed in front of the parameter referencing it, otherwise the generated code will not compile.
+`NULLABLE` marks a pointer that may be null. Alone, it is one optional value
+led on the wire by a presence byte; an out-value also travels in with the
+caller's contents, so a call that fails without writing it leaves the
+caller's variable as it was. It composes with `LENGTH` on a
+`RECV_ONLY` pointer to declare an optional out-array, and on a `SEND_ONLY`
+pointer to declare an optional in-array the caller may leave null
+(`ncclCommInitAll`'s `devlist`), which leads with a presence byte on the wire. A pointer count marked
+`SEND_RECV` supports the `cuGraphGetNodes` query pattern; a by-value count is a
+fixed capacity. Each array leads with its own presence byte on the wire, and
+several arrays may share one count.
+`ON_ERROR` may be added to a `RECV_ONLY NULLABLE LENGTH` buffer when CUDA only
+writes the buffer on failure. The generated response preserves the caller's
+buffer on success.
+`SCALAR:<owner> SIZE:<expr>` marks a SEND_ONLY pointer that the `<owner>` parameter
+(`ncclRedOpCreatePreMulSum`'s `residence`) places on the host or on the device. The
+generated client asks `scalar_on_host(<owner>, "<name>")` and sends the value
+in host mode or the address in device mode, with the width leading on the wire
+so the server can tell which. `SIZE:<expr>` is a C++ expression the client
+evaluates over the call's arguments (`SIZE:nccl_type_width(datatype)`).
+
+`VERSIONED` marks an optional pointer to a size-led, append-only configuration
+struct (NCCL's `ncclConfig_t`). The caller's `size` bytes travel, then each
+member named in `STRINGS:<member>,...` as its length and text; the server widens
+the struct to its own size and points those members at its copies, and nulls
+the client addresses named in `CLEARED:<member>,...`. A member some supported
+headers lack takes `MEMBERGUARD:<member>=<condition>`; its length still travels,
+so client and server built against different headers share one wire format.
+
+A call whose only answer is its status, with every parameter `SEND_ONLY` and no
+`@synchronize`, is sent with `rpc_write_end` and not waited for. Such a request
+carries a ticket: its handler sends no answer and keeps a failure for the
+client's next synchronize, and a later request from any lane is dispatched only
+once the call has been submitted. A request sent with `rpc_wait_for_response`
+carries no ticket and is answered. Mark the exceptions `@blocking`: calls whose
+contract is the wait itself, whose status is their result, or whose server call
+waits on the GPU. On a forwarding backend that sets `async_success` the choice
+is made at run time: the generated wrapper asks `submit_async(conn)`. NCCL uses
+this for calls inside a group, which the library only queues.
+
+Client routing can also be annotated for handles that belong to a specific LUPINE
+server connection. `@routingkey <kind> <param>` selects the connection for the
+generated client wrapper before it writes the RPC. Supported kinds are
+`DEVICE`, `CONTEXT`, `MODULE`, `FUNCTION`, `STREAM`, `EVENT`, `MEMORY_POOL`,
+`GRAPH`, `GRAPH_NODE`, `GRAPH_EXEC`, and `DEVICEPTR`.
+`@routingkey CURRENT_CONTEXT` routes through the client's current CUDA context
+owner. `DEVICE` and `CONTEXT` routing is inferred from the first non-pointer
+`CUdevice` or `CUcontext` parameter, so those annotations are only needed when
+the routing key is not the first matching parameter. A by-value `ncclComm_t`
+or `ncclParamHandle_t` infers `HANDLE` routing to the connection the handle was
+created on, which the creating call's body records with `note_handle_owner`.
+
+Forwarding backends also accept `@routingkey EVENT <param>`. Their client must
+provide `connection_for_event(event)`, which selects the connection without
+changing the event handle sent to the server.
+Likewise, `@routingkey STREAM <param>` uses `connection_for_stream(stream)`.
+The backend helper handles default streams; the stream argument is sent
+unchanged.
+
+NVML wrappers use the same mechanism. A by-value `nvmlDevice_t` parameter
+infers `NVML_DEVICE` routing: the generated client resolves its owning server
+and substitutes the remote handle before marshalling the request. Device lookup
+APIs without an input handle use `@routingkey ALL` together with
+`@recordowner NVML_DEVICE <output>` to search every server and translate the
+returned remote handle back to the client's virtual device handle.
+
+Inverse CUDA device lookups use `@routingkey ALL <output>`. The generated
+client tries each local and remote route, then translates the successful
+route-local device back to its virtual client ordinal before returning it.
+
+`@deeparray <param> <array-member> <count-member>` copies an embedded array
+along with its struct. SEND_RECV returns the struct's scalar fields and preserves
+the caller's input array pointer and contents. RECV_ONLY provides client-owned
+array storage owned by the graph node already identified by routing metadata.
+All graph-node parameter getters share this storage, which remains valid until
+the node's parameters change or the node is destroyed. Graph destruction
+collects node handles only when cached arrays exist, then releases their storage
+after CUDA successfully destroys the graph.
+
+`@disabled client` leaves server/RPC generation enabled while requiring a
+manual client implementation with the original API name. These manual symbols
+remain part of the generated client function map.
+
+A declaration with parameters but no `@param` lines is a client stub: the
+generated function ignores its arguments and returns the backend's
+not-supported status, and no RPC id, server handler, or registration is
+generated for it. Use it for entry points whose arguments cannot cross the
+wire, such as client callbacks.
+
+`@guard <preprocessor-expression>` wraps the generated client wrapper, server
+handler, function-map entry, and server registration. Use it for APIs that are
+not declared by every supported CUDA toolkit, such as an API introduced in a
+newer CUDA minor release.
+
+Generated wrappers can record ownership for handles returned by an API with
+`@recordowner <kind> <param>`. Supported owner kinds are `CONTEXT`, `MODULE`,
+`FUNCTION`, `STREAM`, `EVENT`, `MEMORY_POOL`, `GRAPH`, `GRAPH_NODE`,
+`GRAPH_EXEC`, and `DEVICEPTR`. Ownership is recorded only after the CUDA call
+returns `CUDA_SUCCESS`.
+
+Some APIs need small, reusable behaviors beyond plain parameter send/receive
+layout. These should be expressed as annotations when the behavior is generic
+enough for more than one API or can be described without API-specific C++.
+Currently, `@crossservercopy <dst> <src> <bytes> [STREAM:<param>] [ASYNC]` adds
+a generated client fallback for device-to-device copies whose source and
+destination pointers are owned by different server connections. The fallback
+routes through the client-side cross-server copy helper.
+`@graphexecnode <graph-exec> <node>` translates an original graph node to the
+private graph clone associated with an executable before the generated server
+handler calls CUDA.
+`@graphexecupdate <graph-exec> <graph> <error>` updates the executable from a
+private rebound clone of the graph, as instantiation does, moves its server-side
+graph resources to the update graph's after CUDA reports success, and maps
+error nodes in `<error>` back to the caller's graph.
+
+Functions that need custom client-side code around the generated call may be
+written as definitions instead of declarations. The body must contain one
+explicitly typed generated-call placeholder and end by returning its result
+(a `void` call has a bare `LUPINE_GENERATED_CALL();` and no return):
+
+```cpp
+CUresult cuExample(CUdeviceptr ptr) {
+  prepare(ptr);
+  CUresult return_value = LUPINE_GENERATED_CALL();
+  if (return_value == CUDA_SUCCESS)
+    update_bookkeeping(ptr);
+  return return_value;
+}
+```
+
+The generator emits code before the placeholder once before route dispatch and
+code after it on both the local and remote paths. It validates the result type,
+placeholder count, and final return. Functions without custom client code stay
+as ordinary declarations.
+
+`CUdeviceptr` values go on the wire unchanged: identity VA arenas place every
+client-visible alias at its server address, so no per-parameter translation is
+generated (connections that cannot reserve the identity arena fail at connect).
+Client-dirty mapped pages are flushed centrally before each CUDA RPC request.
+`@routingfallback <kind> <param>` can be paired with stream routing for APIs
+that route by stream when a stream is supplied and by another object otherwise.
+`@synchronize [STDOUT]` refreshes mapped host allocations after a successful
+call. Its answer carries the push watermark, so the client applies the pushed
+device-to-host copies the call waited for before it returns, and `STDOUT`
+returns the device printf output captured around the call. Both sides are generated: the server writes these fields ahead of the
+CUDA result and the client reads them in the same order.
+`@synchronize DEVICEPTR <param>` marks an address the call writes from the
+device, as a copy or memset does. It does not synchronize: when the address
+names a mapped host allocation, the next synchronize refreshes the client's
+view of it, as it does for an allocation a kernel was given.
+
+Keep function-specific code in manual files when the behavior cannot be
+described by annotations without embedding C++ for that exact API. Typical
+manual cases include callback forwarding, CUDA graph capture bookkeeping,
+stdout capture, local host allocation, local file loading, cross-server event
+waits, manual client/server wire framing, and server-side deferred-copy queue
+management.
+
+With the annotations in place, `codegen.py` reads in the annotations and generates the RPC server and client.
+Run it through `./codegen/run.sh` from the repository root. The runner uses the
+same pinned CUDA 13.3.1 container as CI so generated output does not depend on
+the host's installed toolkit or Python packages.
+
+The motivation for this approach is grounded in codegen being very good at ensuring that the RPC server and client
+match in behavior but not very good at determining the specifics of what should be sent and received. Humans, on
+the other hand, are very good at the latter but not the former. Therefore, this specification file allows humans
+to edit and build out the "layout" of the RPC call without having to worry about ensuring the server and client
+remain at parity.
+
+## Why a custom wire format?
+
+One might ask why not use something like a protobuf instead of this custom wire format? The main reason is we would
+end up needing to generate the proto file anyways since the volume of requests and responses is way too high.
+Ultimately, that would end up with substantially more code and another layer of abstraction.
+
+Additionally, using protobuf makes it challenging, but not impossible, to transfer opaque blocks of memory and cast
+them as protobuf has its own opinion on memory layout. One advantage of a custom wire format is we can read from
+the RPC directly into the destination, saving us a byte shuffling layer.
+
+Lastly, doing something very custom in protobuf is not nearly as easy. For example, `cudaMemcpy` requires a completely
+custom implementation as the wire format is dependent on the `kind` parameter. This is straightforward to do as
+we can stub out the implementation with our custom codegen but if we were to tie ourselves to protobuf we would
+need an escape hatch.
+
+## Future Improvements
+
+Some improvements that can be made:
+
+- [ ] We could use C++ annotations to make the processing a little more "C++"-y. Worth investigating for a bit.

@@ -1,0 +1,26 @@
+name: Codegen Test
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  codegen:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Regenerate checked-in sources
+        run: ./codegen/run.sh
+
+      - name: Verify generated files are current
+        run: git diff --exit-code -- codegen

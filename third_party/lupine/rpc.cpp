@@ -1,0 +1,1285 @@
+#include "rpc.h"
+#include "lupine_log.h"
+#include "process_handoff.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <string.h>
+#include <thread>
+#include <utility>
+
+#ifndef _WIN32
+#include <netdb.h>
+#include <sys/mman.h>
+#endif
+
+#if defined(__linux__) && !defined(MAP_FIXED_NOREPLACE)
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+namespace {
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+void *lupine_va_reserve_exact(uintptr_t base, size_t size) {
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+  flags |= MAP_NORESERVE;
+#endif
+  flags |= MAP_FIXED_NOREPLACE;
+  void *mapping =
+      mmap(reinterpret_cast<void *>(base), size, PROT_NONE, flags, -1, 0);
+  if (mapping == MAP_FAILED) {
+    return nullptr;
+  }
+  if (mapping != reinterpret_cast<void *>(base)) {
+    munmap(mapping, size);
+    return nullptr;
+  }
+  return mapping;
+}
+#endif
+
+} // namespace
+
+void lupine_va_release(conn_t *conn) {
+  if (conn == nullptr || conn->va_size == 0) {
+    return;
+  }
+#if !defined(_WIN32) && !defined(__APPLE__)
+  munmap(reinterpret_cast<void *>(conn->va_base + conn->w_offset),
+         conn->va_size);
+  munmap(reinterpret_cast<void *>(conn->va_base), conn->va_size);
+#endif
+  conn->va_base = 0;
+  conn->va_size = 0;
+  conn->va_next = 0;
+}
+
+lupine_va_window lupine_va_local_window(void) {
+#if defined(_WIN32) || defined(__APPLE__)
+  // No arena can be hosted here, so state none and let the peer fall back.
+  return {};
+#else
+  return {LUPINE_VA_FIRST_BASE, LUPINE_VA_ARENA_SIZE * LUPINE_VA_ARENA_COUNT};
+#endif
+}
+
+int lupine_va_reserve_client(conn_t *conn, const lupine_va_window &window,
+                             unsigned int min_slot, unsigned int *slot) {
+  const size_t arena = window.size / LUPINE_VA_ARENA_COUNT;
+  if (conn == nullptr || slot == nullptr || conn->va_size != 0 || arena == 0) {
+    return -1;
+  }
+#if defined(_WIN32) || defined(__APPLE__)
+  (void)min_slot;
+  return 1;
+#else
+  for (unsigned int candidate = min_slot; candidate < LUPINE_VA_ARENA_COUNT;
+       ++candidate) {
+    uintptr_t offset = static_cast<uintptr_t>(candidate) * arena;
+    uintptr_t base = window.base + offset;
+    uintptr_t write_base = LUPINE_VA_WRITE_BASE + offset;
+    if (lupine_va_reserve_exact(base, arena) == nullptr) {
+      continue;
+    }
+    if (lupine_va_reserve_exact(write_base, arena) == nullptr) {
+      munmap(reinterpret_cast<void *>(base), arena);
+      continue;
+    }
+    conn->va_base = base;
+    conn->va_size = arena;
+    conn->va_next = 0;
+    conn->w_offset =
+        static_cast<intptr_t>(write_base) - static_cast<intptr_t>(base);
+    *slot = candidate;
+    return 0;
+  }
+  return -1;
+#endif
+}
+
+bool lupine_va_claim(conn_t *conn, size_t size, size_t alignment,
+                     uintptr_t *claimed) {
+  if (conn == nullptr || claimed == nullptr || conn->va_size == 0 ||
+      size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+      size > conn->va_size) {
+    return false;
+  }
+  uintptr_t current = __atomic_load_n(&conn->va_next, __ATOMIC_RELAXED);
+  for (;;) {
+    uintptr_t next_claim = (current + alignment - 1) & ~(alignment - 1);
+    if (next_claim < current || next_claim < conn->va_base ||
+        next_claim - conn->va_base > conn->va_size - size) {
+      return false;
+    }
+    if (__atomic_compare_exchange_n(&conn->va_next, &current, next_claim + size,
+                                    true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+      *claimed = next_claim;
+      return true;
+    }
+  }
+}
+
+int lupine_va_reserve_server(conn_t *conn, uintptr_t base, size_t size) {
+  if (conn == nullptr || conn->va_size != 0) {
+    return -1;
+  }
+#if defined(_WIN32) || defined(__APPLE__)
+  return -1;
+#else
+  if (lupine_va_reserve_exact(base, size) == nullptr) {
+    return -1;
+  }
+  // Keep the placeholder for the connection lifetime. Backends replace only
+  // monotonically claimed portions, so MAP_FIXED never touches foreign VMAs.
+  conn->va_base = base;
+  conn->va_size = size;
+  conn->va_next = base;
+  return 0;
+#endif
+}
+
+// lupine_tcp_connect only resolves and dials; the caller owns TLS setup and
+// the HTTP/2 session. Retried connections use bounded attempts and exponential
+// backoff; zero retries preserves the one-shot blocking policy.
+lupine_socket_t
+lupine_tcp_connect(const char *host, const char *port, unsigned int max_retries,
+                   const std::function<bool(lupine_socket_t)> &dialing) {
+  constexpr int kInitialBackoffMs = 1000;
+  constexpr int kMaxBackoffMs = 30000;
+  constexpr int kConnectTimeoutMs = 10000;
+
+  // Every client dial funnels through here, and on Windows no socket call --
+  // getaddrinfo included -- works until Winsock has been started. The server
+  // starts it from main; a client shim has no such entry point of its own.
+  if (lupine_socket_init() < 0) {
+    LUPINE_LOG_ERROR("Socket initialization failed");
+    return LUPINE_INVALID_SOCKET;
+  }
+
+  for (int attempt = 0;; ++attempt) {
+    addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo *res = nullptr;
+    int gai_status = getaddrinfo(host, port, &hints, &res);
+    if (gai_status != 0 || res == nullptr) {
+      LUPINE_LOG_ERROR("Resolving "
+                       << host << " port " << port << " failed: "
+                       << (gai_status != 0 ? gai_strerror(gai_status)
+                                           : strerror(errno)));
+    } else {
+      for (addrinfo *ai = res; ai != nullptr; ai = ai->ai_next) {
+        lupine_socket_t sockfd =
+            socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (sockfd == LUPINE_INVALID_SOCKET) {
+          continue;
+        }
+        lupine_socket_apply_transport_options(sockfd);
+        bool handed = false;
+        int result = dialing ? lupine_socket_connect_with_timeout(
+                                   sockfd, ai->ai_addr,
+                                   static_cast<socklen_t>(ai->ai_addrlen), -1,
+                                   [&] { return handed = dialing(sockfd); })
+                     : max_retries == 0
+                         ? connect(sockfd, ai->ai_addr,
+                                   static_cast<socklen_t>(ai->ai_addrlen))
+                         : lupine_socket_connect_with_timeout(
+                               sockfd, ai->ai_addr,
+                               static_cast<socklen_t>(ai->ai_addrlen),
+                               kConnectTimeoutMs);
+        if (result == 0) {
+          freeaddrinfo(res);
+          return sockfd;
+        }
+        if (handed) {
+          dialing(LUPINE_INVALID_SOCKET);
+        }
+        lupine_socket_close(sockfd);
+        if (max_retries == 0) {
+          break;
+        }
+      }
+      freeaddrinfo(res);
+    }
+
+    if (static_cast<unsigned int>(attempt) >= max_retries) {
+      return LUPINE_INVALID_SOCKET;
+    }
+
+    int delay_ms = kInitialBackoffMs;
+    for (int i = 0; i < attempt && delay_ms < kMaxBackoffMs; ++i) {
+      delay_ms *= 2;
+    }
+    if (delay_ms > kMaxBackoffMs) {
+      delay_ms = kMaxBackoffMs;
+    }
+    LUPINE_LOG_ERROR("Connecting to " << host << " port " << port
+                                      << " failed, retrying in " << delay_ms
+                                      << "ms (" << (max_retries - attempt)
+                                      << " retries left)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+  }
+}
+
+void rpc_cancel_async_waits(conn_t *conn) {
+  if (!conn->async_sync_initialized) {
+    return;
+  }
+  pthread_mutex_lock(&conn->async_mutex);
+  conn->async_cancelled = true;
+  pthread_cond_broadcast(&conn->async_cond);
+  pthread_mutex_unlock(&conn->async_mutex);
+}
+
+void rpc_shutdown_transport_socket(conn_t *conn) {
+  if (conn == nullptr) {
+    return;
+  }
+  __atomic_store_n(&conn->closed, 1, __ATOMIC_RELEASE);
+  const lupine_socket_t socket =
+      __atomic_load_n(&conn->connfd, __ATOMIC_ACQUIRE);
+  rpc_cancel_async_waits(conn);
+  if (conn->http2 != nullptr) {
+    rpc_http2_shutdown(conn);
+  } else if (socket != LUPINE_INVALID_SOCKET) {
+    lupine_socket_shutdown_read(socket);
+  }
+}
+
+void rpc_close_transport_socket(conn_t *conn) {
+  if (conn == nullptr) {
+    return;
+  }
+  __atomic_store_n(&conn->closed, 1, __ATOMIC_RELEASE);
+  lupine_socket_t socket = __atomic_exchange_n(
+      &conn->connfd, LUPINE_INVALID_SOCKET, __ATOMIC_ACQ_REL);
+  rpc_cancel_async_waits(conn);
+  if (socket == LUPINE_INVALID_SOCKET) {
+    // A session parked for a checkpoint reconnect has no socket of its own.
+    rpc_http2_destroy(conn);
+    return;
+  }
+  struct linger abortive = {};
+  abortive.l_onoff = 1;
+  abortive.l_linger = 0;
+  (void)setsockopt(socket, SOL_SOCKET, SO_LINGER,
+                   reinterpret_cast<const char *>(&abortive), sizeof(abortive));
+  // Wake a reader blocked in recv without sending a FIN. SHUT_RDWR would
+  // gracefully close the write side before SO_LINGER can reset the peer.
+  lupine_socket_shutdown_read(socket);
+  rpc_http2_destroy(conn);
+  (void)lupine_socket_close(socket);
+}
+
+static unsigned char *rpc_inline_write_buffer(conn_t *conn);
+static bool rpc_is_inline_write_buffer(const conn_t *conn,
+                                       const unsigned char *buffer);
+
+static void rpc_write_buffer_release(conn_t *conn) {
+  if (conn == nullptr) {
+    return;
+  }
+  if (!rpc_is_inline_write_buffer(conn, conn->write_copy_buffer)) {
+    free(conn->write_copy_buffer);
+  }
+  conn->write_copy_buffer = nullptr;
+  conn->write_copy_capacity = 0;
+  conn->write_copy_offset = 0;
+}
+
+// Leaves room for the header cursors rpc_write_end fills in.
+static void rpc_write_queue_reset(conn_t *conn) {
+  rpc_write_buffer_release(conn);
+  conn->write_queue.assign(2, rpc_write_cursor());
+}
+
+void rpc_conn_init(conn_t *conn, lupine_socket_t connfd, int request_id) {
+  *conn = {};
+  conn->connfd = connfd;
+  conn->request_id = request_id;
+  conn->local_request_parity = request_id & 1;
+  // Default-attribute initialization cannot fail on any supported platform.
+  pthread_mutex_init(&conn->write_mutex, nullptr);
+  pthread_mutex_init(&conn->call_mutex, nullptr);
+  pthread_mutex_init(&conn->async_mutex, nullptr);
+  pthread_cond_init(&conn->async_cond, nullptr);
+  conn->async_sync_initialized = 1;
+}
+
+// The ticket claimed by the handler running on this lane, if any.
+static constexpr uint64_t kNoAsyncSequence = ~uint64_t{0};
+static thread_local uint64_t executing_async_sequence = kNoAsyncSequence;
+// Whether the client waits for the answer to the request this lane handles,
+// and whether something it only checked was not submitted yet.
+static thread_local bool handling_awaited_request = false;
+static thread_local bool handling_unsettled_request = false;
+
+bool rpc_request_awaited(conn_t *) { return handling_awaited_request; }
+bool rpc_request_unsettled(conn_t *) { return handling_unsettled_request; }
+
+static bool rpc_async_ticket_released_locked(const conn_t *conn,
+                                             uint64_t ticket) {
+  return ticket < conn->serving_async_sequence ||
+         (ticket - conn->serving_async_sequence <
+              conn->completed_async_sequences.size() &&
+          conn->completed_async_sequences[ticket -
+                                          conn->serving_async_sequence]);
+}
+
+bool rpc_async_ticket_released(conn_t *conn, uint64_t ticket) {
+  if (ticket == kNoAsyncSequence) {
+    return true;
+  }
+  pthread_mutex_lock(&conn->async_mutex);
+  bool released = rpc_async_ticket_released_locked(conn, ticket);
+  pthread_mutex_unlock(&conn->async_mutex);
+  return released;
+}
+
+int rpc_async_sequence_wait(conn_t *conn, uint64_t value, bool exact) {
+  pthread_mutex_lock(&conn->async_mutex);
+  while (!conn->async_cancelled &&
+         (exact ? !rpc_async_ticket_released_locked(conn, value)
+                : conn->serving_async_sequence < value)) {
+    ++conn->async_waiters;
+    int waited = pthread_cond_wait(&conn->async_cond, &conn->async_mutex);
+    --conn->async_waiters;
+    if (waited != 0) {
+      pthread_mutex_unlock(&conn->async_mutex);
+      return -1;
+    }
+  }
+  bool cancelled = conn->async_cancelled;
+  pthread_mutex_unlock(&conn->async_mutex);
+  return cancelled ? -1 : 0;
+}
+
+int rpc_async_sequence_begin(conn_t *conn, uint64_t sequence) {
+  if (conn->closed) {
+    return -1;
+  }
+  // A claim this lane never released must not hold back every later request.
+  rpc_async_sequence_end(conn);
+  // The sequence labels completion; it no longer holds an execution turn.
+  executing_async_sequence = sequence;
+  return 0;
+}
+
+void rpc_async_sequence_end(conn_t *conn) {
+  uint64_t sequence = executing_async_sequence;
+  if (sequence == kNoAsyncSequence) {
+    return;
+  }
+  executing_async_sequence = kNoAsyncSequence;
+  pthread_mutex_lock(&conn->async_mutex);
+  auto &completed = conn->completed_async_sequences;
+  if (sequence >= conn->serving_async_sequence) {
+    uint64_t index = sequence - conn->serving_async_sequence;
+    if (index >= completed.size()) {
+      completed.resize(index + 1);
+    }
+    completed[index] = true;
+    while (!completed.empty() && completed.front()) {
+      completed.pop_front();
+      ++conn->serving_async_sequence;
+    }
+  }
+  // A watermark waiter can only be released by the watermark moving, but a
+  // scoped request may be waiting for exactly this ticket.
+  if (conn->async_waiters != 0) {
+    pthread_cond_broadcast(&conn->async_cond);
+  }
+  pthread_mutex_unlock(&conn->async_mutex);
+}
+
+void rpc_conn_destroy(conn_t *conn) {
+  if (conn == nullptr) {
+    return;
+  }
+  rpc_close_transport_socket(conn);
+  lupine_va_release(conn);
+  std::deque<bool>().swap(conn->completed_async_sequences);
+  conn->scope_last.clear();
+  conn->retired_scopes.clear();
+  rpc_write_buffer_release(conn);
+  std::vector<rpc_write_cursor>().swap(conn->write_queue);
+  std::vector<rpc_host_allocation_write>().swap(conn->host_allocation_writes);
+  conn->async_sync_initialized = 0;
+  pthread_cond_destroy(&conn->async_cond);
+  pthread_mutex_destroy(&conn->async_mutex);
+  pthread_mutex_destroy(&conn->write_mutex);
+  pthread_mutex_destroy(&conn->call_mutex);
+}
+
+namespace {
+
+using rpc_connection_closed_hook = void (*)(conn_t *);
+using rpc_thread_lane_destroyed_hook = void (*)(uint64_t);
+using rpc_response_completed_hook = void (*)(conn_t *, int32_t);
+using rpc_host_range_is_protected_hook = bool (*)(uintptr_t, size_t);
+
+std::atomic<rpc_connection_closed_hook> connection_closed_hook{nullptr};
+std::atomic<rpc_thread_lane_destroyed_hook> thread_lane_destroyed_hook{nullptr};
+std::atomic<rpc_response_completed_hook> response_completed_hook{nullptr};
+std::atomic<rpc_host_range_is_protected_hook> host_range_is_protected_hook{
+    nullptr};
+std::atomic_flag lifecycle_hooks_set = ATOMIC_FLAG_INIT;
+
+} // namespace
+
+int rpc_set_lifecycle_hooks(const rpc_lifecycle_hooks *hooks) {
+  if (hooks == nullptr ||
+      lifecycle_hooks_set.test_and_set(std::memory_order_acq_rel)) {
+    return -1;
+  }
+  connection_closed_hook.store(hooks->connection_closed,
+                               std::memory_order_release);
+  thread_lane_destroyed_hook.store(hooks->thread_lane_destroyed,
+                                   std::memory_order_release);
+  response_completed_hook.store(hooks->response_completed,
+                                std::memory_order_release);
+  host_range_is_protected_hook.store(hooks->host_range_is_protected,
+                                     std::memory_order_release);
+  return 0;
+}
+
+static void rpc_mark_connection_closed(conn_t *conn) {
+  conn->closed = 1;
+  rpc_cancel_async_waits(conn);
+  auto hook = connection_closed_hook.load(std::memory_order_acquire);
+  if (hook != nullptr) {
+    hook(conn);
+  }
+}
+
+namespace {
+
+struct rpc_thread_lane {
+  uint64_t id = static_cast<uint64_t>(
+      std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+  ~rpc_thread_lane() {
+    auto hook = thread_lane_destroyed_hook.load(std::memory_order_acquire);
+    if (hook != nullptr) {
+      hook(id);
+    }
+  }
+};
+
+static thread_local rpc_thread_lane rpc_tls_lane;
+
+struct rpc_read_frame {
+  int32_t stream_id = -1;
+  int request_id = 0;
+  int op = 0;
+};
+
+struct rpc_response_route {
+  int request_id = 0;
+  int32_t stream_id = -1;
+};
+
+struct rpc_nested_write_frame {
+  conn_t *conn = nullptr;
+  rpc_write_builder builder;
+  alignas(std::max_align_t) unsigned char write_copy_inline[256] = {};
+};
+
+// Bytes of the bound lane already taken from the transport, read before the
+// lane's next transport bytes. Only this thread reads its bound lane.
+struct rpc_read_ahead {
+  size_t offset = 0;
+  size_t size = 0;
+  unsigned char data[4096];
+};
+
+struct rpc_thread_io {
+  conn_t *bound_conn = nullptr;
+  int32_t bound_stream = -1;
+  rpc_read_ahead ahead;
+  conn_t *read_conn = nullptr;
+  rpc_read_frame read;
+  conn_t *write_conn = nullptr;
+  rpc_nested_write_frame nested_write;
+  conn_t *response_conn = nullptr;
+  rpc_response_route response;
+  conn_t *held_call_lock = nullptr;
+};
+
+static thread_local rpc_thread_io rpc_tls_io;
+// Set while a client answers a server callback: requests it sends then are
+// part of the callback, as ones nested in its response are.
+static thread_local conn_t *rpc_tls_callback_reply = nullptr;
+
+void rpc_save_outer_response(conn_t *conn) {
+  rpc_tls_io.nested_write.conn = conn;
+  std::swap(rpc_tls_io.nested_write.builder,
+            static_cast<rpc_write_builder &>(*conn));
+}
+
+void rpc_restore_outer_response(conn_t *conn) {
+  std::swap(rpc_tls_io.nested_write.builder,
+            static_cast<rpc_write_builder &>(*conn));
+  rpc_tls_io.nested_write.conn = nullptr;
+}
+
+void rpc_release_write_builder(conn_t *conn, bool request_nested_in_response) {
+  rpc_write_buffer_release(conn);
+  if (request_nested_in_response) {
+    rpc_restore_outer_response(conn);
+    return;
+  }
+  rpc_tls_io.write_conn = nullptr;
+  pthread_mutex_unlock(&conn->write_mutex);
+}
+
+void rpc_release_held_call_lock(conn_t *conn) {
+  if (rpc_tls_io.held_call_lock == conn) {
+    rpc_tls_io.held_call_lock = nullptr;
+    pthread_mutex_unlock(&conn->call_mutex);
+  }
+}
+
+} // namespace
+
+static unsigned char *rpc_inline_write_buffer(conn_t *conn) {
+  return rpc_tls_io.nested_write.conn == conn
+             ? rpc_tls_io.nested_write.write_copy_inline
+             : conn->write_copy_inline;
+}
+
+static bool rpc_is_inline_write_buffer(const conn_t *conn,
+                                       const unsigned char *buffer) {
+  return buffer == conn->write_copy_inline ||
+         buffer == rpc_tls_io.nested_write.write_copy_inline;
+}
+
+int rpc_bind_http2_stream(conn_t *conn, int32_t stream_id) {
+  if (conn == nullptr || stream_id < 0) {
+    return -1;
+  }
+  rpc_tls_io.bound_conn = conn;
+  rpc_tls_io.bound_stream = stream_id;
+  rpc_tls_io.ahead.offset = rpc_tls_io.ahead.size = 0;
+  return 0;
+}
+
+void rpc_unbind_http2_stream(conn_t *conn) {
+  if (rpc_tls_io.bound_conn == conn) {
+    rpc_tls_io.bound_conn = nullptr;
+    rpc_tls_io.bound_stream = -1;
+    rpc_tls_io.ahead.offset = rpc_tls_io.ahead.size = 0;
+  }
+}
+
+static int rpc_read_stream(conn_t *conn, int32_t stream_id, void *data,
+                           size_t size) {
+  rpc_read_ahead &ahead = rpc_tls_io.ahead;
+  if (rpc_tls_io.bound_conn != conn || rpc_tls_io.bound_stream != stream_id) {
+    return rpc_http2_read_stream(conn, stream_id, data, size);
+  }
+  auto *out = static_cast<unsigned char *>(data);
+  size_t buffered = std::min(size, ahead.size - ahead.offset);
+  memcpy(out, ahead.data + ahead.offset, buffered);
+  ahead.offset += buffered;
+  if (buffered == size) {
+    return 0;
+  }
+  out += buffered;
+  size -= buffered;
+  if (size >= sizeof(ahead.data)) {
+    return rpc_http2_read_stream(conn, stream_id, out, size);
+  }
+  size_t extra = sizeof(ahead.data) - size;
+  int result = rpc_http2_read_stream(conn, stream_id, ahead.data, size, &extra);
+  if (result == 0) {
+    memcpy(out, ahead.data, size);
+    ahead.offset = size;
+    ahead.size = size + extra;
+  }
+  return result;
+}
+
+int32_t rpc_current_http2_stream(conn_t *conn) {
+  if (rpc_tls_io.read_conn == conn) {
+    return rpc_tls_io.read.stream_id;
+  }
+  if (rpc_tls_io.bound_conn == conn) {
+    return rpc_tls_io.bound_stream;
+  }
+  return rpc_http2_dispatch_stream(conn);
+}
+
+int rpc_dispatch(conn_t *conn, int parity) {
+  if (conn == nullptr || conn->closed) {
+    return -1;
+  }
+  int32_t stream_id = rpc_current_http2_stream(conn);
+  if (stream_id < 0) {
+    return -1;
+  }
+  int header[2] = {};
+  bool unsettled = false;
+  for (;;) {
+    int result = rpc_read_stream(conn, stream_id, header, sizeof(header));
+    if (result != 0) {
+      if (result != LUPINE_RPC_HTTP2_STREAM_END) {
+        rpc_mark_connection_closed(conn);
+      }
+      return -1;
+    }
+    if (parity != 0 || header[0] != 0) {
+      break;
+    }
+    // Optional wait markers: {0, 0, published async count} waits for every
+    // ticket below it, {0, 1, ticket} for that one. HTTP/2 continues
+    // receiving the following payload while this lane waits for submission.
+    // {0, 2, ticket} only checks.
+    uint64_t value = 0;
+    if (header[1] < 0 || header[1] > 2 ||
+        rpc_read_stream(conn, stream_id, &value, sizeof(value)) != 0) {
+      rpc_mark_connection_closed(conn);
+      return -1;
+    }
+    if (header[1] == 2) {
+      unsettled = unsettled || !rpc_async_ticket_released(conn, value);
+      continue;
+    }
+    if (rpc_async_sequence_wait(conn, value, header[1] == 1) < 0) {
+      rpc_mark_connection_closed(conn);
+      return -1;
+    }
+  }
+  if (header[0] < 2 || header[0] % 2 != parity) {
+    rpc_mark_connection_closed(conn);
+    return -1;
+  }
+  // A client request carries a ticket after {id, op}, or none when its client
+  // waits for the answer. The handler holds a ticket until it returns, so
+  // later requests from any lane wait for the call's submission.
+  if (parity == 0) {
+    uint64_t ticket = 0;
+    if (rpc_read_stream(conn, stream_id, &ticket, sizeof(ticket)) != 0) {
+      rpc_mark_connection_closed(conn);
+      return -1;
+    }
+    handling_awaited_request = ticket == kNoAsyncSequence;
+    handling_unsettled_request = unsettled;
+    if (!handling_awaited_request &&
+        rpc_async_sequence_begin(conn, ticket) < 0) {
+      rpc_mark_connection_closed(conn);
+      return -1;
+    }
+  }
+  rpc_tls_io.read_conn = conn;
+  rpc_tls_io.read = {stream_id, header[0], header[1]};
+  return header[1];
+}
+
+// rpc_read_start waits for a response with a specific request id on the
+// given connection. this function is used to wait for a response to a request
+// that was sent with rpc_write_end.
+//
+// Once this returns, the matching frame is reserved for the caller until
+// rpc_read_end() completes it.
+int rpc_read_start(conn_t *conn, int write_id) {
+  if (rpc_tls_io.response_conn != conn ||
+      rpc_tls_io.response.request_id != write_id) {
+    rpc_release_held_call_lock(conn);
+    return -1;
+  }
+  int32_t stream_id = rpc_tls_io.response.stream_id;
+  int header[2] = {};
+  if (rpc_read_stream(conn, stream_id, header, sizeof(header)) != 0 ||
+      header[0] != write_id || header[1] != -1) {
+    // An earlier request's answer means client and server disagree on whether
+    // that call is answered: a handwritten side out of step with codegen.
+    if (header[1] == -1 && header[0] < write_id) {
+      LUPINE_LOG_ERROR("answer to request "
+                       << header[0] << " arrived while waiting for " << write_id
+                       << "; the client did not wait "
+                          "for it");
+    }
+    rpc_mark_connection_closed(conn);
+    rpc_release_held_call_lock(conn);
+    return -1;
+  }
+  rpc_tls_io.read_conn = conn;
+  rpc_tls_io.read = {stream_id, header[0], header[1]};
+  return 0;
+}
+
+void *rpc_host_allocation_alias(conn_t *conn, void *data, size_t size) {
+  uintptr_t address = reinterpret_cast<uintptr_t>(data);
+  if (conn->va_size != 0 && conn->w_offset != 0 &&
+      lupine_va_contains(conn, address, size)) {
+    return reinterpret_cast<void *>(address + conn->w_offset);
+  }
+  if (conn->va_size == 0 && conn->w_offset != 0) {
+    uintptr_t read_base =
+        LUPINE_HOST_ALLOCATION_SERVER_BASE + LUPINE_HOST_ALLOCATION_R_OFFSET;
+    if (address >= read_base && size <= LUPINE_HOST_ALLOCATION_WINDOW_SIZE &&
+        address - read_base <= LUPINE_HOST_ALLOCATION_WINDOW_SIZE - size) {
+      uintptr_t server_address = address - LUPINE_HOST_ALLOCATION_R_OFFSET;
+      return reinterpret_cast<void *>(server_address + conn->w_offset);
+    }
+  }
+  return nullptr;
+}
+
+int rpc_note_host_allocation_write(conn_t *conn, void *data, size_t written) {
+  if (pthread_mutex_lock(&conn->write_mutex) != 0) {
+    return -1;
+  }
+  uintptr_t start = reinterpret_cast<uintptr_t>(data);
+  if (!conn->host_allocation_writes.empty() &&
+      conn->host_allocation_writes.back().start +
+              conn->host_allocation_writes.back().size ==
+          start) {
+    conn->host_allocation_writes.back().size += written;
+  } else {
+    conn->host_allocation_writes.push_back({start, written});
+  }
+  if (written != 0) {
+    __atomic_store_n(&conn->host_allocation_writes_pending, 1,
+                     __ATOMIC_RELEASE);
+  }
+  if (pthread_mutex_unlock(&conn->write_mutex) != 0) {
+    return -1;
+  }
+  if (written != 0) {
+    static const uintptr_t page_size = []() {
+      long configured_page_size = sysconf(_SC_PAGESIZE);
+      return configured_page_size > 0
+                 ? static_cast<uintptr_t>(configured_page_size)
+                 : static_cast<uintptr_t>(4096);
+    }();
+    uintptr_t page_start = start & ~(page_size - 1);
+    uintptr_t page_end = (start + written + page_size - 1) & ~(page_size - 1);
+    auto protected_range =
+        host_range_is_protected_hook.load(std::memory_order_acquire);
+    int protection =
+        protected_range == nullptr || protected_range(start, written)
+            ? PROT_READ
+            : PROT_READ | PROT_WRITE;
+    if (mprotect(reinterpret_cast<void *>(page_start), page_end - page_start,
+                 protection) < 0) {
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static int rpc_read_http2(conn_t *conn, void *data, size_t size) {
+  int32_t stream_id = rpc_current_http2_stream(conn);
+  return stream_id < 0 ? -1 : rpc_read_stream(conn, stream_id, data, size);
+}
+
+int rpc_read(conn_t *conn, void *data, size_t size) {
+  void *alias = rpc_host_allocation_alias(conn, data, size);
+  int result = rpc_read_http2(conn, alias != nullptr ? alias : data, size);
+  if (result < 0 || alias == nullptr) {
+    return result;
+  }
+  return rpc_note_host_allocation_write(conn, data, size) < 0 ? -1 : 0;
+}
+
+int rpc_read_pitched(conn_t *conn, void *data, size_t width, size_t rows,
+                     size_t row_stride, size_t slices, size_t slice_stride) {
+  for (size_t z = 0; z < slices; ++z) {
+    char *slice = (char *)data + z * slice_stride;
+    for (size_t row = 0; row < rows; ++row) {
+      if (rpc_read(conn, slice + row * row_stride, width) < 0) {
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
+int rpc_drain(conn_t *conn, size_t size) {
+  char buffer[64 * 1024];
+  size_t offset = 0;
+  while (offset < size) {
+    size_t chunk = std::min(sizeof(buffer), size - offset);
+    if (rpc_read(conn, buffer, chunk) < 0) {
+      return -1;
+    }
+    offset += chunk;
+  }
+  return 0;
+}
+
+int rpc_read_end(conn_t *conn) {
+  if (rpc_tls_io.read_conn == conn) {
+    int read_id = rpc_tls_io.read.request_id;
+    int32_t stream_id = rpc_tls_io.read.stream_id;
+    bool completed_response = rpc_tls_io.read.op == -1;
+    rpc_tls_io.read_conn = nullptr;
+    rpc_tls_io.read = {};
+    rpc_release_held_call_lock(conn);
+    if (completed_response) {
+      auto hook = response_completed_hook.load(std::memory_order_acquire);
+      if (hook != nullptr) {
+        hook(conn, stream_id);
+      }
+    }
+    return read_id;
+  }
+  rpc_release_held_call_lock(conn);
+  return -1;
+}
+
+// Per-op RPC statistics, enabled by setting LUPINE_RPC_STATS to an output
+// path. Records how many requests each op sends and how long callers spend
+// blocked waiting for the response; dumped as TSV at process exit.
+struct lupine_rpc_stat {
+  uint64_t count = 0;
+  uint64_t wait_ns = 0;
+};
+static std::unordered_map<int, lupine_rpc_stat> lupine_rpc_stats;
+static pthread_mutex_t lupine_rpc_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static const char *lupine_rpc_stats_path() {
+  static const char *path = getenv("LUPINE_RPC_STATS");
+  return path;
+}
+
+static void lupine_rpc_stats_dump() {
+  FILE *f = fopen(lupine_rpc_stats_path(), "w");
+  if (f == nullptr) {
+    return;
+  }
+  pthread_mutex_lock(&lupine_rpc_stats_mutex);
+  for (const auto &entry : lupine_rpc_stats) {
+    fprintf(f, "%d\t%llu\t%llu\n", entry.first,
+            (unsigned long long)entry.second.count,
+            (unsigned long long)entry.second.wait_ns);
+  }
+  pthread_mutex_unlock(&lupine_rpc_stats_mutex);
+  fclose(f);
+}
+
+static void lupine_rpc_stats_record(int op, uint64_t count_inc,
+                                    uint64_t wait_ns) {
+  pthread_mutex_lock(&lupine_rpc_stats_mutex);
+  static bool registered = false;
+  if (!registered) {
+    registered = true;
+    atexit(lupine_rpc_stats_dump);
+  }
+  lupine_rpc_stat &stat = lupine_rpc_stats[op];
+  stat.count += count_inc;
+  stat.wait_ns += wait_ns;
+  pthread_mutex_unlock(&lupine_rpc_stats_mutex);
+}
+
+static uint64_t lupine_rpc_stats_now_ns() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void rpc_expect_answer(conn_t *conn) { conn->write_awaited = true; }
+
+// rpc_wait_for_response is a convenience function that sends the current
+// request and then waits for the corresponding response. this pattern is
+// so common that having this function keeps the codegen much cleaner.
+int rpc_wait_for_response(conn_t *conn) {
+  int op = conn->write_op;
+  uint64_t start =
+      lupine_rpc_stats_path() != nullptr ? lupine_rpc_stats_now_ns() : 0;
+  rpc_expect_answer(conn);
+  int write_id = rpc_write_end(conn);
+  if (write_id < 0) {
+    return -1;
+  }
+  // The writer sends queued requests independently. Waiting for this response
+  // must not also wait for unrelated output on other lanes to drain.
+  rpc_http2_response_wait_begin(conn);
+  int result = rpc_read_start(conn, write_id);
+  rpc_http2_response_wait_end(conn);
+  if (result < 0) {
+    return -1;
+  }
+  if (lupine_rpc_stats_path() != nullptr) {
+    lupine_rpc_stats_record(op, 0, lupine_rpc_stats_now_ns() - start);
+  }
+  return 0;
+}
+
+// rpc_write_start_request starts a new request builder on the given connection
+// index with a specific op code.
+//
+// only one request can be active at a time, so this function will take the
+// request lock from the connection.
+// The last unanswered request on `key`, or the last one on no object.
+static rpc_scope_ticket rpc_scope_snapshot(conn_t *conn, uintptr_t key) {
+  if (key == RPC_SCOPE_NONE) {
+    return conn->connection_last;
+  }
+  if (key == RPC_SCOPE_HOST_WRITES) {
+    return conn->host_writes_last;
+  }
+  auto it = conn->scope_last.find(key);
+  return it == conn->scope_last.end() ? rpc_scope_ticket{} : it->second;
+}
+
+// Waits for `last` unless this lane sent it: a lane's requests arrive in order.
+// A soft request only checks it: kind 2 instead of 1.
+static void rpc_scope_wait_for(conn_t *conn, const rpc_scope_ticket &last) {
+  rpc_request_scope &scope = conn->write_scope;
+  if (last.ticket == kNoAsyncSequence || last.lane == conn->write_stream_id) {
+    return;
+  }
+  for (const rpc_wait_marker &wait : scope.waits) {
+    if (wait.value == last.ticket) {
+      return;
+    }
+  }
+  scope.waits.push_back({0, scope.soft ? 2 : 1, last.ticket});
+}
+
+void rpc_begin_callback_reply(conn_t *conn) { rpc_tls_callback_reply = conn; }
+void rpc_end_callback_reply() { rpc_tls_callback_reply = nullptr; }
+
+static int rpc_request_key(conn_t *conn, uintptr_t key, bool publish) {
+  if (conn == nullptr || rpc_tls_io.write_conn != conn) {
+    return -1;
+  }
+  rpc_request_scope &scope = conn->write_scope;
+  if (key == RPC_SCOPE_NONE || key == RPC_SCOPE_LANE) {
+    return 0;
+  }
+  if (publish) {
+    scope.keys.push_back(key);
+  }
+  // A request on no scope waits for every earlier ticket already.
+  if (scope.scoped) {
+    rpc_scope_wait_for(conn, rpc_scope_snapshot(conn, key));
+  }
+  return 0;
+}
+
+int rpc_request_on(conn_t *conn, uintptr_t key) {
+  return rpc_request_key(conn, key, true);
+}
+
+int rpc_request_after(conn_t *conn, uintptr_t key) {
+  return rpc_request_key(conn, key, false);
+}
+
+void rpc_scope_forget(conn_t *conn, uintptr_t key) {
+  pthread_mutex_lock(&conn->write_mutex);
+  conn->scope_last.erase(key);
+  pthread_mutex_unlock(&conn->write_mutex);
+}
+
+void rpc_scope_retire(conn_t *conn, uintptr_t key) {
+  if (conn == nullptr) {
+    return;
+  }
+  pthread_mutex_lock(&conn->write_mutex);
+  auto it = conn->scope_last.find(key);
+  if (it != conn->scope_last.end()) {
+    if (it->second.ticket != kNoAsyncSequence) {
+      conn->retired_scopes.push_back(it->second);
+    }
+    conn->scope_last.erase(it);
+  }
+  pthread_mutex_unlock(&conn->write_mutex);
+}
+
+int rpc_request_after_retired(conn_t *conn) {
+  if (conn == nullptr || rpc_tls_io.write_conn != conn) {
+    return -1;
+  }
+  for (const rpc_scope_ticket &last : conn->retired_scopes) {
+    rpc_scope_wait_for(conn, last);
+  }
+  conn->write_scope.retired_count = conn->retired_scopes.size();
+  return 0;
+}
+
+uint64_t rpc_request_pending_ticket(conn_t *conn, uintptr_t key) {
+  if (conn == nullptr || rpc_tls_io.write_conn != conn) {
+    return kNoAsyncSequence;
+  }
+  rpc_scope_ticket last = rpc_scope_snapshot(conn, key);
+  return last.lane == conn->write_stream_id ? kNoAsyncSequence : last.ticket;
+}
+
+int rpc_write_start_request_on(conn_t *conn, const int op, uintptr_t key,
+                               unsigned flags) {
+  if (conn == nullptr || conn->closed) {
+    return -1;
+  }
+  bool request_nested_in_response = rpc_tls_io.write_conn == conn &&
+                                    rpc_tls_io.nested_write.conn == nullptr &&
+                                    conn->write_op == -1;
+  if (rpc_tls_io.write_conn != nullptr && !request_nested_in_response) {
+    return -1;
+  }
+  bool client = conn->local_request_parity == 0;
+  bool scoped = client && key != RPC_SCOPE_ALL;
+  bool host_writes = scoped && key == RPC_SCOPE_HOST_WRITES;
+  int call_lock_result = 0;
+  if (request_nested_in_response) {
+    // Never wait for a call that may itself be waiting for this response's
+    // write lock. A failed side effect is preferable to a lock-order deadlock.
+    call_lock_result = pthread_mutex_trylock(&conn->call_mutex);
+  } else {
+    call_lock_result = pthread_mutex_lock(&conn->call_mutex);
+  }
+  if (call_lock_result != 0) {
+    return -1;
+  }
+  bool callback = request_nested_in_response ||
+                  (rpc_tls_io.read_conn == conn && rpc_tls_io.read.op != -1) ||
+                  rpc_tls_callback_reply == conn;
+  if (lupine_handoff_request_begin(conn, op, callback) < 0 || conn->closed) {
+    pthread_mutex_unlock(&conn->call_mutex);
+    return -1;
+  }
+  if (request_nested_in_response) {
+    rpc_save_outer_response(conn);
+  } else if (pthread_mutex_lock(&conn->write_mutex) != 0) {
+    pthread_mutex_unlock(&conn->call_mutex);
+    return -1;
+  } else {
+    rpc_tls_io.write_conn = conn;
+  }
+
+  rpc_write_queue_reset(conn);
+  conn->request_id = conn->request_id + 2; // leave the last bit the same
+  conn->write_id = conn->request_id;
+  conn->write_op = op;
+  // Dependencies are taken under the builder lock, in the order requests are
+  // written. Taken earlier, two overlapping requests could both wait on the
+  // same old ticket, and a later one waiting on the newest would not cover the
+  // other. Every request waits only on requests written before it.
+  conn->write_dependency = client && !scoped ? conn->issued_async_sequence : 0;
+  conn->write_awaited = false;
+  conn->write_stream_id =
+      rpc_http2_lane_stream(conn, host_writes ? ~uint64_t{0} : rpc_tls_lane.id);
+  if (conn->write_stream_id < 0) {
+    rpc_release_write_builder(conn, request_nested_in_response);
+    pthread_mutex_unlock(&conn->call_mutex);
+    return -1;
+  }
+  rpc_request_scope &scope = conn->write_scope;
+  scope.scoped = scoped;
+  scope.publish_connection = !scoped || key == RPC_SCOPE_NONE ||
+                             (flags & RPC_REQUEST_PUBLISH_CONNECTION) != 0;
+  scope.publish_host_writes = host_writes;
+  scope.soft = (flags & RPC_REQUEST_SOFT) != 0;
+  scope.keys.clear();
+  scope.waits.clear();
+  scope.retired_count = 0;
+  if (scoped && !host_writes) {
+    rpc_scope_wait_for(conn, rpc_scope_snapshot(conn, RPC_SCOPE_NONE));
+    rpc_scope_wait_for(conn, rpc_scope_snapshot(conn, RPC_SCOPE_HOST_WRITES));
+    rpc_request_on(conn, key);
+  }
+  if (lupine_rpc_stats_path() != nullptr) {
+    lupine_rpc_stats_record(op, 1, 0);
+  }
+  return 0;
+}
+
+// rpc_write_start_request starts a new request builder on the given connection
+// index with a specific op code.
+//
+// only one request can be active at a time, so this function will take the
+// request lock from the connection.
+int rpc_write_start_response(conn_t *conn, const int read_id) {
+  if (conn == nullptr || conn->closed || rpc_tls_io.write_conn != nullptr) {
+    return -1;
+  }
+  if (pthread_mutex_lock(&conn->write_mutex) != 0) {
+    return -1;
+  }
+  rpc_tls_io.write_conn = conn;
+  rpc_write_queue_reset(conn);
+  conn->write_id = read_id;
+  conn->write_op = -1;
+  conn->write_stream_id = rpc_current_http2_stream(conn);
+  if (conn->write_stream_id < 0) {
+    rpc_tls_io.write_conn = nullptr;
+    pthread_mutex_unlock(&conn->write_mutex);
+    return -1;
+  }
+  return 0;
+}
+
+int rpc_write(conn_t *conn, const void *data, const size_t size) {
+  if (size != 0) {
+    conn->write_queue.emplace_back(data, size);
+  }
+  return 0;
+}
+
+// Rows are queued, not copied, so the caller's buffer must stay valid until
+// the surrounding rpc_write_end.
+int rpc_write_pitched(conn_t *conn, const void *data, size_t width, size_t rows,
+                      size_t row_stride, size_t slices, size_t slice_stride) {
+  for (size_t z = 0; z < slices; ++z) {
+    const char *slice = (const char *)data + z * slice_stride;
+    for (size_t row = 0; row < rows; ++row) {
+      if (rpc_write(conn, slice + row * row_stride, width) < 0) {
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
+int rpc_copy_alloc(conn_t *conn, const size_t size) {
+  if (conn == nullptr || conn->write_copy_buffer != nullptr ||
+      conn->write_copy_capacity != 0 || conn->write_copy_offset != 0) {
+    return -1;
+  }
+  if (size == 0) {
+    return 0;
+  }
+  if (size <= sizeof(conn->write_copy_inline)) {
+    conn->write_copy_buffer = rpc_inline_write_buffer(conn);
+  } else {
+    conn->write_copy_buffer = static_cast<unsigned char *>(malloc(size));
+    if (conn->write_copy_buffer == nullptr) {
+      // Continuing after request serialization runs out of memory would leave
+      // client-visible backend state ambiguous, so fail the process
+      // immediately.
+      std::abort();
+    }
+  }
+  conn->write_copy_capacity = size;
+  return 0;
+}
+
+void *rpc_write_buffer(conn_t *conn, size_t size, size_t alignment) {
+  if (conn == nullptr || conn->write_copy_buffer == nullptr) {
+    return nullptr;
+  }
+
+  size_t offset =
+      (conn->write_copy_offset + alignment - 1) / alignment * alignment;
+  size_t required = offset + size;
+  if (required > conn->write_copy_capacity) {
+    return nullptr;
+  }
+  void *buffer = conn->write_copy_buffer + offset;
+  conn->write_copy_offset = required;
+  if (rpc_write(conn, buffer, size) < 0) {
+    return nullptr;
+  }
+  return buffer;
+}
+
+int rpc_write_cursors(conn_t *conn, const rpc_write_cursor *cursors,
+                      size_t count) {
+  conn->write_queue.insert(conn->write_queue.end(), cursors, cursors + count);
+  return 0;
+}
+
+// rpc_write_end finalizes the current request builder on the given connection
+// index and sends the request to the server.
+//
+// the request lock is released after the request is sent and the function
+// returns the request id which can be used to wait for a response.
+int rpc_write_end(conn_t *conn) {
+  if (conn == nullptr || rpc_tls_io.write_conn != conn) {
+    return -1;
+  }
+  bool request = conn->write_op != -1;
+  bool request_nested_in_response = rpc_tls_io.nested_write.conn == conn;
+  if (conn->closed) {
+    rpc_release_write_builder(conn, request_nested_in_response);
+    if (request) {
+      pthread_mutex_unlock(&conn->call_mutex);
+    }
+    return -1;
+  }
+  int write_id = conn->write_id;
+  int32_t write_stream_id = conn->write_stream_id;
+  int result = -1;
+  bool client_request = request && conn->local_request_parity == 0;
+  // A client request is its wait markers, then {id, op} and its ticket. A
+  // connection-wide one has a single marker, for every ticket published
+  // before it started.
+  rpc_wait_marker fence = {0, 0, conn->write_dependency};
+  struct {
+    int request_id;
+    int op;
+    uint64_t ticket;
+  } header;
+  if (conn->write_queue.size() >= 2) {
+    // Only a request nobody waits for takes a ticket. Tickets are dense: one is
+    // taken only by a request that is written, under the builder lock, and
+    // given back below if the write fails.
+    bool ticketed = client_request && !conn->write_awaited;
+    conn->write_ticket =
+        ticketed ? conn->issued_async_sequence++ : kNoAsyncSequence;
+    if (client_request) {
+      const std::vector<rpc_wait_marker> &waits = conn->write_scope.waits;
+      conn->write_queue[0] =
+          conn->write_dependency > 0
+              ? rpc_write_cursor(&fence, sizeof(fence))
+              : rpc_write_cursor(waits.data(), waits.size() * sizeof(waits[0]));
+      header = {write_id, conn->write_op, conn->write_ticket};
+      conn->write_queue[1] = rpc_write_cursor(&header, sizeof(header));
+    } else {
+      conn->write_queue[0] =
+          rpc_write_cursor(&conn->write_id, sizeof(conn->write_id));
+      conn->write_queue[1] =
+          rpc_write_cursor(&conn->write_op, sizeof(conn->write_op));
+    }
+    result =
+        rpc_http2_write_stream(conn, write_stream_id, conn->write_queue.data(),
+                               conn->write_queue.size());
+    if (result != 0 && ticketed) {
+      --conn->issued_async_sequence;
+    }
+    if (result == 0 && ticketed) {
+      // Later requests on the same objects, or connection-wide ones, order
+      // themselves behind this one.
+      const rpc_request_scope &scope = conn->write_scope;
+      rpc_scope_ticket last{conn->write_ticket, write_stream_id};
+      if (scope.publish_connection) {
+        conn->connection_last = last;
+      }
+      if (scope.publish_host_writes) {
+        conn->host_writes_last = last;
+      }
+      for (uintptr_t key : scope.keys) {
+        conn->scope_last[key] = last;
+      }
+      // This ticket now stands for the retired scopes it waited for.
+      conn->retired_scopes.erase(conn->retired_scopes.begin(),
+                                 conn->retired_scopes.begin() +
+                                     scope.retired_count);
+    }
+  }
+  rpc_release_write_builder(conn, request_nested_in_response);
+  if (request) {
+    if (result == 0) {
+      rpc_tls_io.response_conn = conn;
+      rpc_tls_io.response = {write_id, write_stream_id};
+    }
+    // Servers originate RPCs only on the dedicated server-to-client stream.
+    // Keep that stream's request/response exchange serialized so a caller can
+    // read its response directly without an application-level dispatcher.
+    if (result == 0 && conn->local_request_parity == 1) {
+      rpc_tls_io.held_call_lock = conn;
+    } else {
+      pthread_mutex_unlock(&conn->call_mutex);
+    }
+  }
+  return result == 0 ? write_id : -1;
+}

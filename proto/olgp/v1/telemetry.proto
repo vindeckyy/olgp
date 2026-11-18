@@ -1,0 +1,19 @@
+syntax = "proto3";
+package olgp.v1;
+
+message Counters {
+  uint64 blocking_calls = 1;
+  uint64 bytes_wifi = 2;
+  uint64 batch_hits = 3;
+  uint64 batch_misses = 4;
+  uint64 trace_aborts = 5;
+  uint64 cache_hits = 6;
+  uint64 cache_misses = 7;
+  uint64 evictions = 8;
+}
+
+message LatencySample {
+  uint64 rtt_us = 1;
+  uint64 ttft_us = 2;
+  uint64 tokens_per_second = 3;
+}

@@ -1,0 +1,165 @@
+name: Build Windows Server EXE
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  release:
+    types: [published]
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  native-clients:
+    name: Build all native client variants
+    uses: ./.github/workflows/native-clients.yml
+
+  build:
+    name: Windows server executable CUDA ${{ matrix.cuda }}
+    needs: native-clients
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CUDA 13 split the nvcc component: crt holds the host_config.h that
+          # cuda_runtime.h includes, and nvvm holds cicc, the device frontend.
+          - cuda: 13.3.1
+            extra_packages: ', "crt", "nvvm"'
+          - cuda: 12.9.1
+          # The runner's MSVC both postdates the host compilers CUDA 11.8 knows
+          # about and static_asserts on nvcc this old from its own STL headers.
+          - cuda: 11.8.0
+            cuda_flags: -allow-unsupported-compiler
+            host_defines: /D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
+
+    env:
+      VCPKG_TARGET_TRIPLET: x64-windows-static
+      # MSBuild's CUDA integration drops defines passed through nvcc, so the
+      # STL version override has to reach cl.exe by its own environment.
+      CL: ${{ matrix.host_defines }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download all native client variants
+        uses: actions/download-artifact@v8
+        with:
+          pattern: lupine-client-*
+          path: client-libs
+          merge-multiple: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.9.18"
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          # nvcc and the MSBuild integration are what enable_language(CUDA)
+          # needs; without them CMake fails with "No CUDA toolset found".
+          sub-packages: '["cudart", "nvml_dev", "nvcc", "visual_studio_integration"${{ matrix.extra_packages }}]'
+
+      - name: Set up vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vcpkgRoot = Join-Path $env:RUNNER_TEMP 'vcpkg'
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $vcpkgRoot
+          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install nghttp2 and OpenSSL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # OpenSSL comes from vcpkg under the static triplet so it links into
+          # the executable. Left to CMake, the runner image's shared OpenSSL is
+          # found instead and the published exe depends on libssl DLLs that the
+          # artifact does not carry.
+          & "$env:VCPKG_ROOT\vcpkg.exe" install "nghttp2:$env:VCPKG_TARGET_TRIPLET" "openssl:$env:VCPKG_TARGET_TRIPLET"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build/windows-server `
+            -G "Visual Studio 17 2022" `
+            -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            "-DVCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET_TRIPLET" `
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded" `
+            "-DOPENSSL_USE_STATIC_LIBS=ON" `
+            "-DCMAKE_CUDA_FLAGS=${{ matrix.cuda_flags }}" `
+            "-DCUDAToolkit_ROOT=$env:CUDA_PATH" `
+            "-DLUPINE_CLIENT_BUNDLE_INPUT=$PWD\client-libs"
+
+      - name: Build
+        run: cmake --build build/windows-server --config Release --target lupine_driver_server lupine_cuda_smemcpy --parallel
+
+      - name: Verify the executable is self-contained
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = 'build/windows-server/Release/lupine_driver_server.exe'
+          $dumpbin = Get-ChildItem -Path "$env:ProgramFiles*\Microsoft Visual Studio" `
+            -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $deps = & $dumpbin.FullName /dependents $exe
+          $deps | Write-Output
+          # Anything here beyond the system DLLs and the driver has to ship with
+          # the exe, and the artifact carries the exe alone.
+          $bad = $deps | Select-String -Pattern 'libssl|libcrypto|nghttp2|msvcp|vcruntime'
+          if ($bad) {
+            throw "executable depends on DLLs the artifact does not ship: $bad"
+          }
+
+      - name: Collect artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = 'artifacts/lupine-server-windows-cuda-${{ matrix.cuda }}-x86_64'
+          $archive = "$out.zip"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item 'build/windows-server/Release/lupine_driver_server.exe' "$out/lupine_driver_server.exe"
+          Get-FileHash "$out/lupine_driver_server.exe" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  lupine_driver_server.exe" } |
+            Set-Content "$out/SHA256SUMS"
+          if (Test-Path $archive) {
+            Remove-Item $archive -Force
+          }
+          Compress-Archive -Path "$out/*" -DestinationPath $archive
+
+      - name: Upload server executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: lupine-server-windows-cuda-${{ matrix.cuda }}-x86_64
+          path: artifacts/lupine-server-windows-cuda-${{ matrix.cuda }}-x86_64.zip
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release upload `
+            '${{ github.event.release.tag_name }}' `
+            'artifacts/lupine-server-windows-cuda-${{ matrix.cuda }}-x86_64.zip' `
+            --repo '${{ github.repository }}' `
+            --clobber

@@ -1,0 +1,98 @@
+name: Python
+
+concurrency:
+  # A reusable invocation inherits github.workflow from its caller. Namespace
+  # this group so it cannot cancel the caller that is waiting on it.
+  group: python-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: Exact source revision to build
+        required: false
+        type: string
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clients:
+    name: Build native clients
+    uses: ./.github/workflows/native-clients.yml
+    with:
+      checkout_ref: ${{ inputs.checkout_ref || github.sha }}
+      include_runtime: true
+
+  package:
+    name: Assemble and test wheels
+    needs: clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Unit tests exercise the hook explicitly. Do not activate it for the
+      # test runner itself.
+      LUPINE_AUTO: "0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Run Python tests
+        working-directory: python
+        run: |
+          python verify_release.py
+          uv run --all-extras pytest
+
+      - name: Test minimum supported Python
+        working-directory: python
+        run: uv run --python 3.10 --all-extras pytest
+
+      - name: Build Python packages
+        working-directory: python
+        run: |
+          uv build --wheel --out-dir dist/lupine
+          uv build --wheel auto --out-dir dist/lupine-auto
+          python verify_release.py --dist dist
+
+      - name: Upload Python package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: lupine-python-package
+          path: python/dist
+
+  macos-package:
+    name: Package ARM64 macOS runtime wheel
+    needs: clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.checkout_ref || github.sha }}
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/download-artifact@v8
+        with:
+          name: lupine-macos-runtime
+          path: macos-runtime
+      - name: Build wheel with application dylibs and no driver
+        working-directory: python
+        env:
+          LUPINE_MACOS_RUNTIME_DIR: ${{ github.workspace }}/macos-runtime
+        run: |
+          uv build --wheel --out-dir dist/macos
+          python verify_release.py --macos-dist dist/macos
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lupine-macos-python-package
+          path: python/dist/macos
+          if-no-files-found: error

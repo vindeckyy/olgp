@@ -1,0 +1,13 @@
+/target/
+/llvm-cov-target/
+/staging/
+/build-driver/
+/build-virglrenderer/
+/build-lupine/
+/tmp/
+.venv/
+.coverage
+coverage.xml
+artifacts/e2e/*.wav
+.DS_Store
+third_party/*/.git/

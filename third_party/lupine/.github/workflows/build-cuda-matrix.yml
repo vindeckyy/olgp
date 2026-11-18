@@ -1,0 +1,190 @@
+name: Build CUDA Matrix
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  release:
+    types: [published]
+  pull_request:
+  push:
+    branches:
+      - main
+      - cuda-11-builder-support
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  native-clients:
+    name: Build all native client variants
+    uses: ./.github/workflows/native-clients.yml
+
+  build:
+    name: ${{ matrix.component }} CUDA ${{ matrix.cuda }} / Ubuntu ${{ matrix.ubuntu }}
+    needs: native-clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: client
+            cuda: 13.3.1
+            ubuntu: "24.04"
+          - component: server
+            cuda: 13.3.1
+            ubuntu: "24.04"
+          - component: client
+            cuda: 12.9.1
+            ubuntu: "24.04"
+          - component: server
+            cuda: 12.9.1
+            ubuntu: "24.04"
+          - component: client
+            cuda: 11.8.0
+            ubuntu: "22.04"
+          - component: server
+            cuda: 11.8.0
+            ubuntu: "22.04"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download all native client variants
+        if: matrix.component == 'server'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: lupine-client-*
+          path: client-libs
+          merge-multiple: false
+
+      - name: Build ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          bundle_args=()
+          if [ "${{ matrix.component }}" = server ]; then
+            bundle_args+=(
+              --build-arg LUPINE_CLIENT_BUNDLE_INPUT=/opt/lupine/client-libs
+            )
+          fi
+          docker build \
+            -f Dockerfile \
+            --target "${{ matrix.component }}" \
+            --build-arg CUDA_VERSION="${{ matrix.cuda }}" \
+            --build-arg UBUNTU_VERSION="${{ matrix.ubuntu }}" \
+            "${bundle_args[@]}" \
+            -t "lupine-${{ matrix.component }}:cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}" \
+            .
+
+      - name: Verify build artifacts
+        run: |
+          image="lupine-${{ matrix.component }}:cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}"
+          if [ "${{ matrix.component }}" = "client" ]; then
+            docker run --rm --entrypoint bash "$image" -lc '
+              set -euo pipefail
+              test -e /opt/lupine/lib/libcuda.so.1
+              test -e /opt/lupine/lib/libnccl.so.2
+              case "${{ matrix.cuda }}" in 11.*) ;; *) test -e /opt/lupine/lib/libnvshmem_host.so.3 ;; esac
+              test -e /opt/lupine/lib/libnvidia-ml.so.1
+              test -e /opt/lupine/lib/libamdhip64.so.1
+              test -x /usr/bin/nvidia-smi
+              test "${LD_LIBRARY_PATH%%:*}" = /opt/lupine/lib
+              test ! -d /usr/local/cuda
+              test ! -d /opt/rocm
+            '
+          else
+            docker run --rm --entrypoint bash "$image" -lc '
+              set -euo pipefail
+              test -x /opt/lupine/bin/lupine_driver_server
+              test ! -e /opt/lupine/client-bundles
+              test -e /usr/local/cuda/compat/libcuda.so.1
+              test -e /opt/rocm/lib/libamdhip64.so
+              ! ldd /opt/lupine/bin/lupine_driver_server | grep -q "not found"
+            '
+          fi
+
+      - name: Collect client artifacts
+        if: matrix.component == 'client'
+        run: |
+          set -euo pipefail
+          image="lupine-client:cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}"
+          out="artifacts/lupine-client-cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}-x86_64"
+          archive="${out}.zip"
+          mkdir -p "$out"
+
+          container="$(docker create "$image")"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+
+          docker cp "$container:/opt/lupine/lib/libcuda.so.1" "$out/libcuda.so.1"
+          cuda_major="${{ matrix.cuda }}"
+          cuda_major="${cuda_major%%.*}"
+          docker cp "$container:/opt/lupine/lib/libnccl.so.2" "$out/libnccl.so.2"
+          # nvSHMEM's package for CUDA 11 predates the host-only header the
+          # shim builds from, so the shim starts at CUDA 12.
+          nvshmem_libs=()
+          if [[ "$cuda_major" != 11 ]]; then
+            nvshmem_lib="$(docker run --rm --entrypoint sh "$image" -c 'ls /opt/lupine/lib/libnvshmem_host.so.[0-9]*')"
+            docker cp "$container:$nvshmem_lib" "$out/$(basename "$nvshmem_lib")"
+            cp "$out/$(basename "$nvshmem_lib")" "$out/libnvshmem_host.so"
+            nvshmem_libs=(libnvshmem_host.so "$(basename "$nvshmem_lib")")
+          fi
+          docker cp "$container:/opt/lupine/lib/libnvidia-ml.so.1" "$out/libnvidia-ml.so.1"
+          docker cp "$container:/opt/lupine/lib/libamdhip64.so.1" "$out/libamdhip64.so.1"
+          cp "$out/libcuda.so.1" "$out/libcuda.so"
+          cp "$out/libnccl.so.2" "$out/libnccl.so"
+          cp "$out/libnvidia-ml.so.1" "$out/libnvidia-ml.so"
+          cp "$out/libamdhip64.so.1" "$out/libamdhip64.so"
+          (cd "$out" && sha256sum libcuda.so libcuda.so.1 libnccl.so libnccl.so.2 "${nvshmem_libs[@]}" libnvidia-ml.so libnvidia-ml.so.1 libamdhip64.so libamdhip64.so.1 > SHA256SUMS)
+          (cd "$out" && zip -r "../$(basename "$archive")" .)
+
+      - name: Collect server artifacts
+        if: matrix.component == 'server'
+        run: |
+          set -euo pipefail
+          image="lupine-server:cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}"
+          out="artifacts/lupine-server-cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}-x86_64"
+          archive="${out}.zip"
+          mkdir -p "$out"
+
+          container="$(docker create "$image")"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+
+          docker cp "$container:/opt/lupine/bin/lupine_driver_server" "$out/lupine_driver_server"
+          docker cp "$container:/opt/lupine/lib/liblupine-server.so" "$out/liblupine-server.so"
+          docker cp "$container:/opt/lupine/include/server_api.h" "$out/server_api.h"
+          chmod +x "$out/lupine_driver_server"
+          (cd "$out" && sha256sum lupine_driver_server liblupine-server.so server_api.h > SHA256SUMS)
+          (cd "$out" && zip -r "../$(basename "$archive")" .)
+
+      - name: Upload client artifacts
+        if: matrix.component == 'client'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lupine-client-cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}-x86_64
+          path: artifacts/lupine-client-cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}-x86_64.zip
+          if-no-files-found: error
+
+      - name: Upload server artifacts
+        if: matrix.component == 'server'
+        uses: actions/upload-artifact@v7
+        with:
+          name: lupine-server-cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}-x86_64
+          path: artifacts/lupine-server-cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}-x86_64.zip
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="artifacts/lupine-${{ matrix.component }}-cuda-${{ matrix.cuda }}-ubuntu${{ matrix.ubuntu }}-x86_64.zip"
+          gh release upload \
+            "${{ github.event.release.tag_name }}" \
+            "$asset" \
+            --repo "${{ github.repository }}" \
+            --clobber

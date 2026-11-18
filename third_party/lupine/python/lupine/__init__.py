@@ -1,0 +1,326 @@
+"""PyTorch adapter for LUPINE-backed CUDA devices.
+
+``lupine.connect(...)`` points the process at one or more LUPINE GPU
+servers and preloads the server-selected client (the CUDA driver API and
+NVML) so ordinary CUDA consumers — PyTorch included — transparently run on
+the remote GPUs:
+
+.. code-block:: python
+
+    import lupine
+
+    with lupine.connect(host="gpu-host:14833") as session:
+        import torch
+
+        x = torch.arange(8, device=session.device(), dtype=torch.float32)
+        print((x * 2).cpu())
+
+The adapter returns ordinary ``torch.device("cuda:N")`` objects; PyTorch
+keeps its built-in CUDA dispatch path, and its own CUDA runtime and
+libraries run against the LUPINE driver shim underneath it. No NVIDIA driver
+is required on the client: the wheel is pure Python and the bound server
+supplies its compatible client.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+from . import _bundles
+
+DEFAULT_PORT = 14833
+
+
+class LupineError(RuntimeError):
+    """Raised when the LUPINE adapter cannot select a usable device."""
+
+
+class LupineAuthenticationError(LupineError):
+    """Raised when Lupine Cloud needs a user credential."""
+
+
+def _torch() -> Any:
+    try:
+        import torch
+    except ModuleNotFoundError as exc:
+        raise LupineError("PyTorch is required to use LUPINE devices.") from exc
+    return torch
+
+
+def _normalize_server(host: str, port: int | None = None) -> str:
+    host = str(host).strip()
+    if not host:
+        raise LupineError("host must not be empty")
+    if host.startswith(("http://", "https://")):
+        try:
+            parsed = urlsplit(host)
+            hostname = parsed.hostname
+            need_port = port is not None or (
+                parsed.scheme == "http" and parsed.port is None
+            )
+        except ValueError as exc:
+            raise LupineError("host must include a server name") from exc
+        if not hostname:
+            raise LupineError("host must include a server name")
+        netloc = parsed.netloc
+        if need_port:
+            endpoint_port = int(port) if port is not None else DEFAULT_PORT
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            userinfo, sep, _ = netloc.rpartition("@")
+            netloc = f"{userinfo}{sep}{hostname}:{endpoint_port}"
+        return urlunsplit(
+            (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+        )
+    if not host.startswith("[") and host.count(":") > 1:
+        host = f"[{host}]"
+    has_port = "]:" in host if host.startswith("[") else ":" in host
+    if has_port:
+        server, port_str = host.rsplit(":", 1)
+    else:
+        server, port_str = host, ""
+    if host.startswith("["):
+        if not server.endswith("]") or not server[1:-1].strip():
+            raise LupineError("host must include a server name")
+    elif not server:
+        raise LupineError("host must include a server name")
+    if port is not None:
+        # An explicit port replaces the one in the host, as it does for URLs.
+        return f"{server}:{int(port)}"
+    if has_port:
+        if not port_str:
+            raise LupineError("host port must not be empty")
+        return host
+    return f"{server}:{DEFAULT_PORT}"
+
+
+def _normalize_hosts(
+    host: str | Sequence[str], port: int | None = None
+) -> tuple[str, ...]:
+    if isinstance(host, str):
+        return (_normalize_server(host, port),)
+    return tuple(_normalize_server(item, port) for item in host)
+
+
+def _servers_from_env() -> tuple[str, ...]:
+    value = os.environ.get("LUPINE_SERVER", "")
+    if not value:
+        return ()
+    return tuple(s for server in value.split(",") if (s := server.strip()))
+
+
+@dataclass
+class Session:
+    """A process-local LUPINE connection declaration.
+
+    Entering the session exports ``LUPINE_SERVER`` and loads the selected
+    native shims; both stay in effect for the process after exit (library
+    unloading is not possible once CUDA state references the shims).
+    """
+
+    servers: tuple[str, ...]
+    # "driver" uses a CUDA-enabled torch; "torch" uses the native Lupine device.
+    backend: str = "driver"
+    _previous_server: str | None = field(default=None, repr=False)
+    _loaded: bool = field(default=False, repr=False)
+
+    def __enter__(self) -> Session:  # noqa: PYI034
+        if not self.servers:
+            return self
+        if self._loaded:
+            # Already active (e.g. connect() entered before returning the
+            # session); re-entering must not reload or reset state.
+            return self
+        configured = _servers_from_env()
+        if configured and configured != self.servers:
+            raise LupineError(
+                "LUPINE_SERVER is already configured differently; start a new "
+                "process or pass the same hosts to lupine.connect()."
+            )
+        self._previous_server = os.environ.get("LUPINE_SERVER")
+        if not configured:
+            os.environ["LUPINE_SERVER"] = ",".join(self.servers)
+        if sys.platform == "darwin":
+            from . import _backend
+
+            _backend.start()
+            self.backend = "torch"
+        else:
+            from . import _native
+
+            _native.load(missing_ok=False)
+        self._loaded = True
+        return self
+
+    def _device_type(self) -> str:
+        return "lupine" if self.backend == "torch" else "cuda"
+
+    def _device_count(self) -> int:
+        torch = _torch()
+        return int(getattr(torch, self._device_type()).device_count())
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        if self._previous_server is None:
+            os.environ.pop("LUPINE_SERVER", None)
+        else:
+            os.environ["LUPINE_SERVER"] = self._previous_server
+        return False
+
+    def devices(self) -> list[Any]:
+        """Return every GPU in LUPINE's virtual device topology."""
+
+        if not self.servers:
+            return []
+        if not self._loaded and not _native_loaded():
+            raise LupineError(
+                "Session is not active; use 'with lupine.connect(...) as s:'."
+            )
+        torch = _torch()
+        kind = self._device_type()
+        return [torch.device(kind, index) for index in range(self._device_count())]
+
+    def device(self, index: int = 0) -> Any:
+        """Return one GPU from LUPINE's virtual device topology."""
+
+        torch = _torch()
+        count = self._device_count() if self.servers else 0
+        if index >= count or index < -count:
+            hint = ""
+            if count == 0 and _bundles.native_arm64_windows():
+                hint = (
+                    "; this is a native arm64 Python on Windows on ARM, which has "
+                    "no CUDA runtime: run an x64 Python (under the OS's x64 "
+                    "emulation) with the x64 CUDA torch wheel"
+                )
+            raise LupineError(
+                f"device index {index} out of range ({count} devices){hint}"
+            )
+        return torch.device(self._device_type(), range(count)[index])
+
+
+def _native_loaded() -> bool:
+    from . import _backend, _native
+
+    return bool(_native.loaded()) or _backend.is_started()
+
+
+def connect(
+    *,
+    host: str | Sequence[str] | None = None,
+    port: int | None = None,
+) -> Session:
+    """Create a LUPINE session for one or more remote GPU hosts.
+
+    Use the session before any CUDA operation (including ``import torch``
+    on platforms where PyTorch eagerly resolves CUDA symbols):
+
+    ``with lupine.connect(host=["a:14833", "b:14833"]) as s:``
+
+    ``host`` defaults to ``LUPINE_SERVER``, which is how a launcher such as
+    ``lupine run`` hands the session its already-bound hosts.
+
+    ``s.devices()`` then returns every CUDA ordinal in LUPINE's virtual
+    device topology.
+    """
+
+    if host is None:
+        host = _servers_from_env()
+        if not host:
+            raise LupineError("pass host=... or set LUPINE_SERVER")
+
+    session = Session(servers=_normalize_hosts(host, port))
+    # Bind immediately: the caller may import torch right after connect()
+    # without using the context manager form.
+    session.__enter__()
+    return session
+
+
+def cloud(
+    *,
+    api_url: str | None = None,
+    token: str | None = None,
+    gpu_type: str | None = None,
+    gpu_count: int | None = None,
+    region: str | None = None,
+) -> Any:
+    """Acquire and activate an authenticated Lupine Cloud GPU.
+
+    ``token`` defaults to ``LUPINE_API_TOKEN`` and then to the credential
+    stored by ``lupine login``. The lease is released when its context exits
+    or, when called without a context manager, at process shutdown.
+    """
+
+    from ._cloud import connect as connect_cloud
+
+    return connect_cloud(
+        api_url=api_url,
+        token=token,
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        region=region,
+    )
+
+
+def login(**kwargs: Any) -> Any:
+    """Authenticate in a browser and store a Lupine Cloud credential."""
+
+    from ._login import login as browser_login
+
+    return browser_login(**kwargs)
+
+
+def devices() -> list[Any]:
+    """Return devices in PyTorch's current LUPINE-backed CUDA topology."""
+
+    torch = _torch()
+    count = int(torch.cuda.device_count())
+    return [torch.device("cuda", index) for index in range(count)]
+
+
+def servers() -> tuple[str, ...]:
+    """Return configured LUPINE servers from ``LUPINE_SERVER``."""
+
+    return _servers_from_env()
+
+
+def is_configured() -> bool:
+    """Return true when ``LUPINE_SERVER`` names at least one server."""
+
+    return bool(servers())
+
+
+def load_native(*, missing_ok: bool = True) -> dict[str, str]:
+    """Load the server-selected native shims; see :mod:`lupine._native`."""
+
+    from . import _native
+
+    return _native.load(missing_ok=missing_ok)
+
+
+def libdir() -> Any:
+    """Directory holding the selected native shims, if any."""
+
+    from . import _native
+
+    return _native.libdir()
+
+
+__all__ = [
+    "DEFAULT_PORT",
+    "LupineAuthenticationError",
+    "LupineError",
+    "Session",
+    "cloud",
+    "connect",
+    "devices",
+    "is_configured",
+    "libdir",
+    "load_native",
+    "login",
+    "servers",
+]

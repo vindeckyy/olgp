@@ -1,0 +1,12 @@
+[package]
+name = "olgp-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+olgp-control = { path = "../olgp-control" }
+[lints]
+workspace = true

@@ -1,0 +1,79 @@
+#pragma once
+
+// Client-side cache of event completion, and the policy for when cuEventQuery
+// may be answered from it instead of costing a round trip.
+//
+// Per event: the stamp of its current record, and whether that record is known
+// complete. Completion is monotonic between records, so once the server
+// reports an event complete the client can answer later queries for that same
+// record itself. A completion is cached only after the device-to-host
+// deliveries its answer covered have been applied, so a cache hit needs no
+// further wait.
+
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <shared_mutex>
+
+#define LUPINE_CUDA_COMPAT_TYPES_ONLY
+#include "cuda_compat.h"
+#undef LUPINE_CUDA_COMPAT_TYPES_ONLY
+
+#include "rpc.h"
+
+constexpr uint32_t kLupineEventQueryBatch = 16;
+
+struct lupine_event_slot {
+  CUevent event;
+  // Monotonic stamp for this event's current record. It is also the eviction
+  // key, and the token that ties an in-flight query to the record it asked
+  // about: a re-record while that query travels bumps the stamp, so the answer
+  // no longer matches and cannot be cached against the newer record.
+  uint64_t record;
+  bool complete;
+};
+
+struct lupine_event_table {
+  std::mutex mutex;
+  lupine_event_slot slots[kLupineEventQueryBatch] = {};
+  std::atomic<uint64_t> record_seq{0};
+};
+
+// The process-wide table.
+extern lupine_event_table lupine_events;
+
+typedef conn_t *(*lupine_event_conn_resolver)(CUevent event);
+
+// A fresh record voids the cached completion, and starts tracking the event if
+// it was not tracked before.
+void lupine_event_invalidate_completion(lupine_event_table *table,
+                                        CUevent event);
+
+// Voids every cached completion, for work that records events it does not
+// name, such as a graph launch.
+void lupine_event_invalidate_all_completions(lupine_event_table *table);
+
+// Drops the event, so a handle the driver reuses cannot inherit its answer.
+void lupine_event_forget(lupine_event_table *table, CUevent event);
+
+// True when the query has to reach the server. Writes the record stamp to hand
+// back to lupine_event_cache_completions, or zero if the event is not tracked.
+bool lupine_event_query_needed(lupine_event_table *table, CUevent event,
+                               uint64_t *record);
+
+// Fills events/records with other outstanding events on the same connection,
+// to warm the cache alongside a query that is already going out.
+uint32_t lupine_event_collect_query_batch(lupine_event_table *table,
+                                          CUevent exclude, conn_t *conn,
+                                          lupine_event_conn_resolver resolver,
+                                          CUevent *events, uint64_t *records);
+
+// Caches the successful answers whose record stamp still matches.
+void lupine_event_cache_completions(lupine_event_table *table,
+                                    const CUevent *events,
+                                    const uint64_t *records,
+                                    const CUresult *results, uint32_t count);
+
+// Held shared across a query and exclusively across a destroy, so an event
+// cannot be destroyed out from under a query in flight.
+std::shared_mutex &lupine_event_lifecycle_mutex();

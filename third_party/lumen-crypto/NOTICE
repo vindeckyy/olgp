@@ -1,0 +1,4 @@
+Vendored from the Lumen project (https://github.com/vindeckyy/lumen).
+Licensed under MIT OR Apache-2.0. Original notices remain in the source
+repository. Changes for OLGP replace lumen-* identifiers with olgp-* and add
+OLGP-specific pairing fields.

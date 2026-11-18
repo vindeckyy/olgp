@@ -1,0 +1,6 @@
+qemu = "/usr/bin/qemu-system-x86_64"
+image = "/var/lib/olgp/venus/guest.qcow2"
+memory_mib = 4096
+hostmem_mib = 4096
+cpus = 4
+ssh_port = 2222

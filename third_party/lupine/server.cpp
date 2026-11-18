@@ -1,0 +1,885 @@
+#include <atomic>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <stdio.h>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+
+#ifndef _WIN32
+#include <algorithm>
+#include <arpa/inet.h>
+#include <chrono>
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
+#endif
+#include <string>
+
+#include "client_bundle.h"
+#include "dispatch.h"
+#include "ipc.h"
+#include "lupine_log.h"
+#include "monitoring.h"
+#include "process_handoff.h"
+#include "rpc.h"
+#include "rpc_server.h"
+#include "server_api.h"
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+#include "checkpoint.h"
+#include "codegen/gen_rpc_ids.h"
+#include "cuda_server.h"
+#include "server_checkpoint.h"
+#endif
+
+#define DEFAULT_PORT 14833
+#define MAX_CLIENTS 10
+#define MAX_LANES 256
+
+#ifdef LUPINE_EMBED_CLIENT_BUNDLES
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_linux_x86_64;
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_linux_aarch64;
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_macosx_universal2;
+#ifdef LUPINE_EMBED_MACOS_ARM64_CLIENT
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_macosx_arm64;
+#endif
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_win_amd64;
+extern const lupine_client_bundle_payload
+    lupine_embedded_client_bundle_win_arm64;
+
+namespace {
+const lupine_client_bundle_entry kClientBundles[] = {
+    {"linux/amd64", &lupine_embedded_client_bundle_linux_x86_64},
+    {"linux/arm64", &lupine_embedded_client_bundle_linux_aarch64},
+    {"macos/amd64", &lupine_embedded_client_bundle_macosx_universal2},
+#ifdef LUPINE_EMBED_MACOS_ARM64_CLIENT
+    {"macos/arm64", &lupine_embedded_client_bundle_macosx_arm64},
+#else
+    {"macos/arm64", &lupine_embedded_client_bundle_macosx_universal2},
+#endif
+    {"windows/amd64", &lupine_embedded_client_bundle_win_amd64},
+    {"windows/arm64", &lupine_embedded_client_bundle_win_arm64},
+};
+} // namespace
+
+const lupine_client_bundle_registry lupine_embedded_client_bundles = {
+    kClientBundles, sizeof(kClientBundles) / sizeof(kClientBundles[0])};
+#endif
+
+// Empty where bulk connections are unsupported, so no token is handed out.
+static std::string lupine_child_bulk_token;
+
+#ifndef _WIN32
+static volatile sig_atomic_t lupine_parent_termination_requested = 0;
+static volatile sig_atomic_t lupine_parent_child_exited = 0;
+
+static void lupine_parent_sigterm_handler(int) {
+  lupine_parent_termination_requested = 1;
+}
+
+static void lupine_parent_sigchld_handler(int) {
+  lupine_parent_child_exited = 1;
+}
+
+static bool lupine_install_parent_signal_handlers() {
+  struct sigaction term_action = {};
+  term_action.sa_handler = lupine_parent_sigterm_handler;
+  sigemptyset(&term_action.sa_mask);
+
+  struct sigaction child_action = {};
+  child_action.sa_handler = lupine_parent_sigchld_handler;
+  sigemptyset(&child_action.sa_mask);
+
+  return sigaction(SIGTERM, &term_action, nullptr) == 0 &&
+         sigaction(SIGCHLD, &child_action, nullptr) == 0;
+}
+
+#ifndef LUPINE_BUILD_CUDA_BACKEND
+static volatile sig_atomic_t lupine_child_connection_fd = -1;
+
+static void lupine_child_sigterm_handler(int) {
+  int saved_errno = errno;
+  if (lupine_child_connection_fd >= 0) {
+    (void)shutdown(static_cast<int>(lupine_child_connection_fd), SHUT_RDWR);
+  }
+  errno = saved_errno;
+}
+
+static bool lupine_install_child_signal_handler(lupine_socket_t connection) {
+  struct sigaction action = {};
+  action.sa_handler = lupine_child_sigterm_handler;
+  sigemptyset(&action.sa_mask);
+  lupine_child_connection_fd = connection;
+  return sigaction(SIGTERM, &action, nullptr) == 0;
+}
+#endif
+
+// A client may open extra "bulk" TCP connections for large transfers. The
+// parent routes each one to the child that owns the session by the token the
+// child handed out in its handshake response, over a socketpair per child.
+struct lupine_bulk_route {
+  pid_t pid;
+  std::string token;
+  int fd;
+};
+
+struct lupine_pending_socket {
+  lupine_socket_t fd;
+  std::chrono::steady_clock::time_point deadline;
+};
+
+constexpr auto kPendingFirstByteTimeout = std::chrono::seconds(5);
+
+static int lupine_child_bulk_fd = -1;
+
+static std::string lupine_hex(const unsigned char *bytes, size_t size) {
+  static const char digits[] = "0123456789abcdef";
+  std::string out;
+  for (size_t i = 0; i < size; ++i) {
+    out.push_back(digits[bytes[i] >> 4]);
+    out.push_back(digits[bytes[i] & 15]);
+  }
+  return out;
+}
+
+static void
+lupine_reap_connection_children(std::unordered_set<pid_t> &children,
+                                std::vector<lupine_bulk_route> &bulk_routes) {
+  sigset_t child_mask;
+  sigset_t previous_mask;
+  sigemptyset(&child_mask);
+  sigaddset(&child_mask, SIGCHLD);
+  bool signal_blocked =
+      sigprocmask(SIG_BLOCK, &child_mask, &previous_mask) == 0;
+
+  for (;;) {
+    int status = 0;
+    pid_t child = waitpid(-1, &status, WNOHANG);
+    if (child <= 0) {
+      break;
+    }
+    if (WIFSIGNALED(status)) {
+      LUPINE_LOG_ERROR("Connection child " << child << " terminated by signal "
+                                           << WTERMSIG(status));
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
+      LUPINE_LOG_ERROR("Connection child "
+                       << child << " exited abnormally with status " << status);
+    }
+    lupine_monitoring_unregister_pid(child);
+    children.erase(child);
+  }
+  for (auto it = bulk_routes.begin(); it != bulk_routes.end();) {
+    if (children.count(it->pid) != 0) {
+      ++it;
+      continue;
+    }
+    close(it->fd);
+    it = bulk_routes.erase(it);
+  }
+  lupine_parent_child_exited = 0;
+  if (signal_blocked) {
+    (void)sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+  }
+}
+#endif
+
+struct lupine_lane {
+  int32_t id = -1;
+  std::atomic<bool> done{false};
+  std::thread worker;
+};
+
+static int rpc_server_dispatch(conn_t *conn, int op) {
+  LUPINE_TRACE_LOG("LUPINE server handling op " << op);
+  if (op == LUPINE_HANDOFF_DRAIN_REQUEST) {
+    // Read first: the request's ticket must not be held while the drain waits
+    // for calls that may themselves wait on other lanes.
+    int request = rpc_read_end(conn);
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+    lupine_checkpoint_drain_cuda_calls();
+    lupine_dtoh_drain(conn);
+#endif
+    int result = 0;
+    return request < 0 || rpc_write_start_response(conn, request) < 0 ||
+                   rpc_write(conn, &result, sizeof(result)) < 0 ||
+                   rpc_write_end(conn) < 0
+               ? -1
+               : 0;
+  }
+  if (op == LUPINE_RPC_CLIENT_METADATA)
+    return handle_lupine_client_metadata(conn);
+  const rpc_handler *found = lupine_rpc_handler_lookup(op);
+  if (found == nullptr) {
+    LUPINE_LOG_ERROR("No RPC handler for op " << op << "; closing client.");
+    return -1;
+  }
+
+  // The registry holds only handlers of backends built into this server.
+  static const char *const kBackendNames[] = {"CUDA", "NVML", "HIP", "NCCL"};
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  // Bulk sub-requests run under the gate entry of the copy RPC that waits on
+  // them: chunks touch no CUDA state, and readers copy only between that RPC
+  // publishing the copy and it seeing them finish. A gate entry of their own
+  // could block a drain on a caller that never comes. The device-to-host
+  // push lane touches no CUDA state either, and never returns.
+  std::optional<lupine_checkpoint::cuda_call_guard> guard;
+  if ((found->backend == rpc_backend::cuda ||
+       found->backend == rpc_backend::nccl) &&
+      op != LUPINE_RPC_lupineBulkChunk && op != LUPINE_RPC_lupineBulkRead &&
+      op != LUPINE_RPC_lupineDtohPush) {
+    guard.emplace();
+  }
+#endif
+  int result = found->handler(conn);
+  if (result >= 0)
+    return 0;
+  LUPINE_LOG_ERROR("Error handling "
+                   << kBackendNames[static_cast<int>(found->backend)]
+                   << " request for op " << op << ".");
+  return -1;
+}
+
+static void lupine_serve_lanes(conn_t &conn) {
+  std::unordered_map<int32_t, std::shared_ptr<lupine_lane>> lanes;
+  while (!conn.closed) {
+    for (auto it = lanes.begin(); it != lanes.end();) {
+      if (!it->second->done.load(std::memory_order_acquire)) {
+        ++it;
+        continue;
+      }
+      if (it->second->worker.joinable()) {
+        it->second->worker.join();
+      }
+      it = lanes.erase(it);
+    }
+
+    int32_t stream_id = rpc_http2_accept_stream(&conn);
+    if (stream_id < 0) {
+      break;
+    }
+    if (lanes.size() >= MAX_LANES) {
+      LUPINE_LOG_ERROR("Too many active RPC lanes.");
+      break;
+    }
+
+    auto lane = std::make_shared<lupine_lane>();
+    lane->id = stream_id;
+    lane->worker = std::thread([&conn, lane]() {
+      if (rpc_bind_http2_stream(&conn, lane->id) == 0) {
+        while (!conn.closed) {
+          int op = rpc_dispatch(&conn, 0);
+          if (op < 0) {
+            break;
+          }
+          if (rpc_server_dispatch(&conn, op) < 0) {
+            // A failed async handler cannot satisfy another lane's prefix.
+            rpc_shutdown_transport_socket(&conn);
+            break;
+          }
+          // Completes the ticket a fire-and-forget handler claimed, if any.
+          rpc_async_sequence_end(&conn);
+        }
+        if (!conn.closed) {
+          (void)rpc_http2_end_stream(&conn, lane->id);
+        }
+        rpc_unbind_http2_stream(&conn);
+      }
+      lane->done.store(true, std::memory_order_release);
+    });
+    lanes.emplace(stream_id, lane);
+  }
+
+  rpc_shutdown_transport_socket(&conn);
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  // The push lane waits for deliveries, not for the transport.
+  lupine_dtoh_wake(&conn);
+#endif
+  for (auto &entry : lanes) {
+    auto &lane = entry.second;
+    if (lane->worker.joinable()) {
+      lane->worker.join();
+    }
+  }
+}
+
+#ifndef _WIN32
+static void lupine_serve_bulk_connection(int fd,
+                                         rpc_http2_server_metadata metadata) {
+  unsigned char preamble[LUPINE_BULK_PREAMBLE_BYTES];
+  size_t consumed = 0;
+  while (consumed < sizeof(preamble)) {
+    ssize_t n = recv(fd, preamble + consumed, sizeof(preamble) - consumed, 0);
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    if (n <= 0) {
+      close(fd);
+      return;
+    }
+    consumed += static_cast<size_t>(n);
+  }
+  conn_t conn = {};
+  rpc_conn_init(&conn, fd, 1);
+  if (rpc_http2_server_init_with_metadata(&conn, &metadata) == 0) {
+    lupine_serve_lanes(conn);
+  }
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  lupine_server_bulk_connection_lost();
+#endif
+  rpc_conn_destroy(&conn);
+}
+#endif
+
+// Result for a connection that ends before the request loop starts.
+static int lupine_client_handler_exit() {
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  return lupine_server_checkpoint_child_finish();
+#else
+  return 0;
+#endif
+}
+
+int client_handler(lupine_socket_t connfd) {
+  const rpc_http2_server_metadata metadata = {
+#ifdef LUPINE_BACKEND_VERSION
+      LUPINE_BACKEND_VERSION,
+#else
+      nullptr,
+#endif
+#ifdef LUPINE_EMBED_CLIENT_BUNDLES
+      &lupine_embedded_client_bundles,
+#else
+      nullptr,
+#endif
+      lupine_child_bulk_token.empty() ? nullptr
+                                      : lupine_child_bulk_token.c_str(),
+  };
+
+  // Identify the protocol before any RPC state exists: HTTP/2 preface means
+  // an RPC client, anything else is answered as plain HTTP/1.x and the
+  // connection is done.
+  lupine_metrics_handler metrics = nullptr;
+#ifdef LUPINE_MONITORING_ENABLED
+  metrics = lupine_monitoring_render_metrics;
+#endif
+  if (lupine_connection_dispatch(connfd, &metadata, metrics) != 0) {
+    lupine_socket_close(connfd);
+    return lupine_client_handler_exit();
+  }
+
+  conn_t conn = {};
+  rpc_conn_init(&conn, connfd, 1);
+  int http2_init_result = rpc_http2_server_init_with_metadata(&conn, &metadata);
+  if (http2_init_result < 0) {
+    LUPINE_LOG_ERROR("Error initializing HTTP/2 connection.");
+    rpc_conn_destroy(&conn);
+    return lupine_client_handler_exit();
+  }
+  if (http2_init_result != 0) {
+    if (rpc_http2_server_graceful_shutdown(&conn) < 0) {
+      LUPINE_LOG_DEBUG("HTTP/2 peer closed before acknowledging shutdown");
+    }
+    rpc_conn_destroy(&conn);
+    return lupine_client_handler_exit();
+  }
+  lupine_monitoring_register_child();
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  lupine_handoff_on_resume(&conn, lupine_checkpoint_resume_cuda_calls);
+  if (!lupine_server_initialize_connection(&conn)) {
+    LUPINE_LOG_ERROR("Error initializing per-connection CUDA state.");
+    rpc_conn_destroy(&conn);
+    return lupine_server_checkpoint_child_finish();
+  }
+#endif
+
+  LUPINE_LOG_DEBUG("Client connected.");
+
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  if (!lupine_server_checkpoint_connection_ready(rpc_http2_session_id(&conn))) {
+    LUPINE_LOG_ERROR("Failed to restore connection checkpoint.");
+    rpc_conn_destroy(&conn);
+    return lupine_server_checkpoint_child_finish();
+  }
+#endif
+
+#ifndef _WIN32
+  if (lupine_child_bulk_fd >= 0) {
+    std::thread([metadata]() {
+      for (;;) {
+        int fd = lupine_ipc_recv_fd(lupine_child_bulk_fd);
+        if (fd < 0) {
+          return;
+        }
+        std::thread(lupine_serve_bulk_connection, fd, metadata).detach();
+      }
+    }).detach();
+  }
+#endif
+
+  lupine_serve_lanes(conn);
+
+  int checkpoint_result = 0;
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  // Finish checkpointing before releasing per-connection CUDA resources.
+  checkpoint_result = lupine_server_checkpoint_child_finish();
+  lupine_server_cleanup_connection(&conn);
+  lupine_server_cleanup_identity_allocations(&conn);
+#endif
+  rpc_conn_destroy(&conn);
+  return checkpoint_result;
+}
+
+#ifndef _WIN32
+static bool lupine_start_connection_child(lupine_socket_t connfd,
+                                          bool use_checkpoint_provider = true) {
+#ifdef LUPINE_BUILD_CUDA_BACKEND
+  return lupine_server_checkpoint_child_start(connfd, use_checkpoint_provider);
+#else
+  (void)use_checkpoint_provider;
+  return lupine_install_child_signal_handler(connfd);
+#endif
+}
+
+static bool lupine_is_stream_socket(int fd) {
+  int type = 0;
+  socklen_t length = sizeof(type);
+  return getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &length) == 0 &&
+         type == SOCK_STREAM;
+}
+
+static int lupine_serve_inherited_connection(int connfd,
+                                             bool use_checkpoint_provider) {
+  lupine_socket_apply_transport_options(connfd);
+  if (!lupine_start_connection_child(connfd, use_checkpoint_provider)) {
+    lupine_socket_close(connfd);
+    return EXIT_FAILURE;
+  }
+  return client_handler(connfd) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+#endif
+
+#ifdef __linux__
+int lupine_server_serve_connection_v1(int fd) {
+  if (lupine_socket_init() < 0 || !lupine_is_stream_socket(fd)) {
+    LUPINE_LOG_ERROR("Server connection requires a valid stream socket.");
+    lupine_socket_close(fd);
+    return EXIT_FAILURE;
+  }
+  // The embedding application owns checkpoint publication and restore.
+  return lupine_serve_inherited_connection(fd, false);
+}
+#endif
+
+int lupine_server_main() {
+  int port = DEFAULT_PORT;
+  struct sockaddr_in servaddr, cli;
+  if (lupine_socket_init() < 0) {
+    LUPINE_LOG_ERROR("Socket initialization failed.");
+    exit(EXIT_FAILURE);
+  }
+
+#ifndef _WIN32
+  if (const char *inherited = getenv("LUPINE_CONNECTION_FD")) {
+    char *end = nullptr;
+    long fd = strtol(inherited, &end, 10);
+    if (end == inherited || *end != '\0' || fd < 0 || fd > INT_MAX ||
+        !lupine_is_stream_socket(static_cast<int>(fd))) {
+      LUPINE_LOG_ERROR(
+          "LUPINE_CONNECTION_FD must name an inherited stream socket");
+      return EXIT_FAILURE;
+    }
+    return lupine_serve_inherited_connection(static_cast<int>(fd), true);
+  }
+#endif
+
+  lupine_socket_t sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd == LUPINE_INVALID_SOCKET) {
+    LUPINE_LOG_ERROR("Socket creation failed.");
+    exit(EXIT_FAILURE);
+  }
+
+  char *p = getenv("LUPINE_PORT");
+
+  if (p == NULL) {
+    port = DEFAULT_PORT;
+  } else {
+    // Validate LUPINE_PORT so a typo (e.g. "14833x" or "") can't silently
+    // fall back to atoi's 0, which the kernel would reinterpret as an
+    // ephemeral port.
+    char *end = nullptr;
+    long parsed = strtol(p, &end, 10);
+    if (end == p || *end != '\0' || parsed < 1 || parsed > 65535) {
+      LUPINE_LOG_ERROR("Invalid LUPINE_PORT '" << p << "'; expected 1-65535.");
+      exit(EXIT_FAILURE);
+    }
+    port = static_cast<int>(parsed);
+  }
+
+  // Bind the socket
+  memset(&servaddr, 0, sizeof(servaddr));
+  servaddr.sin_family = AF_INET;
+  servaddr.sin_addr.s_addr = INADDR_ANY;
+  servaddr.sin_port = htons(port);
+
+  if (lupine_socket_set_reuseaddr(sockfd) < 0) {
+    LUPINE_LOG_ERROR("Socket bind failed.");
+    exit(EXIT_FAILURE);
+  }
+
+  if (bind(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) != 0) {
+    LUPINE_LOG_ERROR("Socket bind failed.");
+    exit(EXIT_FAILURE);
+  }
+
+  if (listen(sockfd, MAX_CLIENTS) != 0) {
+    LUPINE_LOG_ERROR("Listen failed.");
+    exit(EXIT_FAILURE);
+  }
+
+  if (!lupine_monitoring_initialize()) {
+    lupine_socket_close(sockfd);
+    exit(EXIT_FAILURE);
+  }
+
+  LUPINE_LOG_DEBUG("Server listening on port " << port << "...");
+
+#ifndef _WIN32
+  if (!lupine_install_parent_signal_handlers()) {
+    LUPINE_LOG_ERROR("Failed to install server signal handlers.");
+    lupine_socket_close(sockfd);
+    lupine_monitoring_shutdown();
+    exit(EXIT_FAILURE);
+  }
+  std::unordered_set<pid_t> connection_children;
+  // One broker socket per connection child; children park and fetch backend
+  // shareable fds through the runtime-neutral parent (see ipc.h).
+  std::vector<int> broker_fds;
+#endif
+
+#ifndef _WIN32
+  std::vector<lupine_bulk_route> bulk_routes;
+  // Accepted sockets wait here until their first bytes say whether they are
+  // a bulk connection for a live session or a connection of their own.
+  std::vector<lupine_pending_socket> pending;
+  std::vector<struct pollfd> poll_fds;
+
+  auto spawn_child = [&](lupine_socket_t connfd) {
+    // Fork a process per connection so each client gets isolated backend
+    // runtime state. A client resetting or corrupting its state cannot affect
+    // other clients, and everything is released on disconnect. The parent
+    // must not initialize accelerator runtimes inherited by forked children.
+    fflush(stdout);
+    fflush(stderr);
+
+    sigset_t term_mask;
+    sigset_t previous_mask;
+    sigemptyset(&term_mask);
+    sigaddset(&term_mask, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &term_mask, &previous_mask) != 0) {
+      LUPINE_LOG_ERROR("Failed to block SIGTERM around server fork.");
+      lupine_socket_close(connfd);
+      return;
+    }
+
+    int broker_pair[2] = {-1, -1};
+    int bulk_pair[2] = {-1, -1};
+    lupine_ipc_token bulk_token = {};
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, broker_pair) < 0 ||
+        socketpair(AF_UNIX, SOCK_SEQPACKET, 0, bulk_pair) < 0 ||
+        lupine_ipc_make_token(&bulk_token) < 0) {
+      (void)sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+      LUPINE_LOG_ERROR("Server broker socketpair failed.");
+      for (int fd :
+           {broker_pair[0], broker_pair[1], bulk_pair[0], bulk_pair[1]}) {
+        if (fd >= 0) {
+          close(fd);
+        }
+      }
+      lupine_socket_close(connfd);
+      return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+      (void)sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+      LUPINE_LOG_ERROR("Server fork failed.");
+      close(broker_pair[0]);
+      close(broker_pair[1]);
+      close(bulk_pair[0]);
+      close(bulk_pair[1]);
+      lupine_socket_close(connfd);
+      return;
+    }
+    if (pid == 0) {
+      struct sigaction child_action = {};
+      child_action.sa_handler = SIG_DFL;
+      sigemptyset(&child_action.sa_mask);
+      (void)sigaction(SIGCHLD, &child_action, nullptr);
+
+      lupine_socket_close(sockfd);
+      // Drop inherited parent ends of sibling broker sockets so the parent
+      // sees hangups when their owning children exit.
+      for (int broker_fd : broker_fds) {
+        close(broker_fd);
+      }
+      for (const auto &route : bulk_routes) {
+        close(route.fd);
+      }
+      for (const auto &entry : pending) {
+        if (entry.fd != connfd) {
+          lupine_socket_close(entry.fd);
+        }
+      }
+      close(broker_pair[0]);
+      close(bulk_pair[0]);
+      lupine_ipc_set_broker_fd(broker_pair[1]);
+      lupine_child_bulk_fd = bulk_pair[1];
+      lupine_child_bulk_token =
+          lupine_hex(bulk_token.bytes, sizeof(bulk_token.bytes));
+      if (!lupine_start_connection_child(connfd)) {
+        LUPINE_LOG_ERROR("Failed to initialize graceful child shutdown.");
+        lupine_socket_close(connfd);
+        exit(EXIT_FAILURE);
+      }
+      (void)sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+      int checkpoint_result = client_handler(connfd);
+      exit(checkpoint_result == 0 ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+    close(broker_pair[1]);
+    close(bulk_pair[1]);
+    broker_fds.push_back(broker_pair[0]);
+    bulk_routes.push_back(
+        {pid, lupine_hex(bulk_token.bytes, sizeof(bulk_token.bytes)),
+         bulk_pair[0]});
+    connection_children.insert(pid);
+    (void)sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+    lupine_socket_close(connfd);
+  };
+
+  // Peeks the first bytes of a pending socket. A complete bulk preamble goes
+  // to its session's child; anything else, including a preamble split across
+  // segments, gets a child of its own.
+  auto classify = [&](lupine_socket_t connfd) {
+    unsigned char preamble[LUPINE_BULK_PREAMBLE_BYTES];
+    ssize_t n =
+        recv(connfd, preamble, sizeof(preamble), MSG_PEEK | MSG_DONTWAIT);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+      return false;
+    }
+    if (n <= 0) {
+      lupine_socket_close(connfd);
+      return true;
+    }
+    if (n == static_cast<ssize_t>(sizeof(preamble)) &&
+        memcmp(preamble, LUPINE_BULK_PREAMBLE_MAGIC,
+               LUPINE_BULK_PREAMBLE_MAGIC_BYTES) == 0) {
+      for (const auto &route : bulk_routes) {
+        if (memcmp(preamble + LUPINE_BULK_PREAMBLE_MAGIC_BYTES,
+                   route.token.data(), route.token.size()) == 0) {
+          (void)lupine_ipc_send_fd(route.fd, connfd);
+          break;
+        }
+      }
+      lupine_socket_close(connfd);
+      return true;
+    }
+    spawn_child(connfd);
+    return true;
+  };
+#endif
+
+  // Server loop
+  while (1) {
+#ifndef _WIN32
+    if (lupine_parent_child_exited != 0) {
+      lupine_reap_connection_children(connection_children, bulk_routes);
+    }
+    if (lupine_parent_termination_requested != 0) {
+      break;
+    }
+
+    // Wait for a new connection, a broker request from a child, or the first
+    // bytes of a pending connection.
+    poll_fds.clear();
+    poll_fds.reserve(1 + broker_fds.size() + pending.size());
+    poll_fds.push_back({sockfd, POLLIN, 0});
+    for (int broker_fd : broker_fds) {
+      poll_fds.push_back({broker_fd, POLLIN, 0});
+    }
+    int poll_timeout_ms = -1;
+    if (!pending.empty()) {
+      const auto now = std::chrono::steady_clock::now();
+      auto nearest_deadline = pending.front().deadline;
+      for (size_t i = 1; i < pending.size(); ++i) {
+        if (pending[i].deadline < nearest_deadline) {
+          nearest_deadline = pending[i].deadline;
+        }
+      }
+      if (nearest_deadline <= now) {
+        poll_timeout_ms = 0;
+      } else {
+        auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+            nearest_deadline - now);
+        poll_timeout_ms = remaining.count() > INT_MAX
+                              ? INT_MAX
+                              : static_cast<int>(remaining.count());
+      }
+      for (const auto &entry : pending) {
+        poll_fds.push_back({entry.fd, POLLIN, 0});
+      }
+    }
+    if (poll(poll_fds.data(), poll_fds.size(), poll_timeout_ms) < 0) {
+      if (errno != EINTR) {
+        LUPINE_LOG_ERROR("Server poll failed.");
+      }
+      continue;
+    }
+    size_t broker_end = 1 + broker_fds.size();
+    for (size_t i = 1; i < broker_end; ++i) {
+      if ((poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+        continue;
+      }
+      if (lupine_ipc_broker_parent_handle(poll_fds[i].fd) < 0) {
+        close(poll_fds[i].fd);
+        broker_fds.erase(
+            std::remove(broker_fds.begin(), broker_fds.end(), poll_fds[i].fd),
+            broker_fds.end());
+      }
+    }
+    if (!pending.empty()) {
+      const auto after_poll = std::chrono::steady_clock::now();
+      for (size_t i = broker_end; i < poll_fds.size(); ++i) {
+        const lupine_socket_t pfd = poll_fds[i].fd;
+        if ((poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) != 0 &&
+            classify(pfd)) {
+          pending.erase(
+              std::remove_if(pending.begin(), pending.end(),
+                             [pfd](const lupine_pending_socket &entry) {
+                               return entry.fd == pfd;
+                             }),
+              pending.end());
+          continue;
+        }
+        auto it = std::find_if(pending.begin(), pending.end(),
+                               [pfd](const lupine_pending_socket &entry) {
+                                 return entry.fd == pfd;
+                               });
+        if (it != pending.end() && after_poll >= it->deadline) {
+          lupine_socket_close(pfd);
+          pending.erase(it);
+        }
+      }
+    }
+    if ((poll_fds[0].revents & POLLIN) == 0) {
+      continue;
+    }
+#endif
+    socklen_t len = sizeof(cli);
+    lupine_socket_t connfd = accept(sockfd, (struct sockaddr *)&cli, &len);
+
+    if (connfd == LUPINE_INVALID_SOCKET) {
+#ifndef _WIN32
+      if (lupine_parent_child_exited != 0) {
+        lupine_reap_connection_children(connection_children, bulk_routes);
+      }
+      if (lupine_parent_termination_requested != 0) {
+        break;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+#endif
+      LUPINE_LOG_ERROR("Server accept failed.");
+      continue;
+    }
+
+#ifndef _WIN32
+    if (lupine_parent_termination_requested != 0) {
+      lupine_socket_close(connfd);
+      break;
+    }
+#endif
+
+#ifndef _WIN32
+    // TCP_NODELAY keeps small RPC frames latency-low; keepalive (and optional
+    // buffer sizing) keeps this long-lived connection from being silently
+    // reaped by a NAT/load-balancer/firewall during idle gaps. See
+    // lupine_socket_apply_transport_options.
+    lupine_socket_apply_transport_options(connfd);
+    pending.push_back(
+        {connfd, std::chrono::steady_clock::now() + kPendingFirstByteTimeout});
+#else
+    // Windows has no fork; connections share the server process.
+    std::thread client_thread(client_handler, connfd);
+
+    // detach the thread so it runs independently
+    client_thread.detach();
+#endif
+  }
+
+  lupine_socket_close(sockfd);
+
+#ifndef _WIN32
+  for (const auto &entry : pending) {
+    lupine_socket_close(entry.fd);
+  }
+  pending.clear();
+
+  // Every connection owns backend state in a dedicated child, so each child
+  // must quiesce and optionally persist itself.
+  lupine_reap_connection_children(connection_children, bulk_routes);
+  for (const auto &route : bulk_routes) {
+    close(route.fd);
+  }
+  bulk_routes.clear();
+  for (int broker_fd : broker_fds) {
+    close(broker_fd);
+  }
+  broker_fds.clear();
+  for (pid_t child : connection_children) {
+    (void)kill(child, SIGTERM);
+  }
+
+  int shutdown_result = EXIT_SUCCESS;
+  while (!connection_children.empty()) {
+    int status = 0;
+    pid_t child = waitpid(-1, &status, 0);
+    if (child > 0) {
+      connection_children.erase(child);
+      if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
+        shutdown_result = EXIT_FAILURE;
+      }
+      continue;
+    }
+    if (child < 0 && errno == EINTR) {
+      continue;
+    }
+    if (child < 0 && errno == ECHILD) {
+      connection_children.clear();
+      break;
+    }
+    shutdown_result = EXIT_FAILURE;
+    break;
+  }
+  lupine_monitoring_shutdown();
+  return shutdown_result;
+#else
+  lupine_monitoring_shutdown();
+  return 0;
+#endif
+}

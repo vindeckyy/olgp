@@ -1,0 +1,50 @@
+{
+  "rust_tests": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-rust_tests.log"
+  },
+  "python_tests": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-python_tests.log"
+  },
+  "contract": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-contract.log"
+  },
+  "lupine_patches": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-lupine_patches.log"
+  },
+  "coverage": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-coverage.log"
+  },
+  "driver_script": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-driver_script.log"
+  },
+  "semantic_tests": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-semantic_tests.log"
+  },
+  "venus": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-venus.log"
+  },
+  "quickstart_script": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-quickstart_script.log"
+  },
+  "rtt": {
+    "status": "skipped",
+    "detail": "hardware run not requested; set OLGP_E2E=1 on the paired machines"
+  },
+  "cuda": {
+    "status": "skipped",
+    "detail": "hardware run not requested; set OLGP_E2E=1 on the paired machines"
+  },
+  "voice": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-voice.log"
+  }
+}

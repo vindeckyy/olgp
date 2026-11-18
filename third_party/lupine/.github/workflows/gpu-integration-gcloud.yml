@@ -1,0 +1,1034 @@
+name: GPU Integration on GCE
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The Google Cloud project, Workload Identity Provider, and service account
+# identifiers are intentionally committed here. They are public resource names,
+# not credentials, and fork pull_request workflows cannot read repository
+# variables. Google still issues short-lived credentials only when the provider's
+# repository, workflow, event, and actor conditions match.
+# The dedicated integration dependency-image cache is:
+#   gs://kevmo314-lupine-gpu-integration-cache
+#
+# Keep GCP_SERVICE_ACCOUNT on a custom role rather than project Owner/Editor.
+# Bind it through a Workload Identity Provider condition restricted to this
+# repository's numeric GitHub IDs, this workflow path, trusted events/refs, and
+# maintainer actors.
+# The service account has bucket-scoped Storage Admin access to the dedicated
+# cache bucket, and this workflow owns that bucket's lifecycle configuration.
+
+on:
+  pull_request:
+  # Only trusted main builds publish dependency images. Source-only changes
+  # reuse the existing image and do not need another cache-population run.
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gpu-integration-gcloud.yml
+      - test/run_cuda_library_samples.sh
+      - test/cuda-library-samples/patches/**
+      - test/run_cuda_python_tests.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+  id-token: write
+
+jobs:
+  # The L4 VMs boot from an image with their packages preinstalled, named by a
+  # hash of the provisioning script below and the resolved base image. A run
+  # that finds the image skips the build; a new base image or script rebuilds
+  # it.
+  vm-image:
+    name: GCE VM image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    env:
+      GCP_PROJECT_ID: kevmo314
+      GCP_WORKLOAD_IDENTITY_PROVIDER: projects/272419586516/locations/global/workloadIdentityPools/lupine-github/providers/github
+      GCP_SERVICE_ACCOUNT: lupine-gpu-ci@kevmo314.iam.gserviceaccount.com
+      BASE_IMAGE_PROJECT: ml-images
+      BASE_IMAGE_FAMILY: common-cu129-ubuntu-2404-nvidia-580
+      IMAGE_FAMILY: lupine-gpu-ci
+      BUILDER_ZONES: us-central1-a us-central1-b us-central1-c us-east1-b
+      BUILDER_NAME: lupine-gpu-ci-image-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Resolve VM image
+        id: resolve
+        run: |
+          set -euo pipefail
+          # Runs once as the builder VM's startup script and leaves its verdict
+          # on the serial console.
+          cat > "$RUNNER_TEMP/gpu-ci-image.sh" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          # xtrace echoes the trap unexpanded, so the verdict only appears once.
+          marker=lupine-image-build
+          trap 'echo "$marker: failed" > /dev/ttyS0' ERR
+          export DEBIAN_FRONTEND=noninteractive
+
+          # Zonal GCE Ubuntu mirrors stall for tens of minutes in some fallback zones.
+          find /etc/apt \( -name '*.sources' -o -name '*.list' \) -exec sed -i -E \
+            's#https?://[a-z0-9-]+\.gce\.clouds\.archive\.ubuntu\.com#http://archive.ubuntu.com#g' {} +
+          apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30)
+
+          # The dependency cache is a tarball of the data root, so every image must live
+          # under /var/lib/docker rather than containerd's store.
+          mkdir -p /etc/docker
+          echo '{"features": {"containerd-snapshotter": false}}' > /etc/docker/daemon.json
+
+          apt-get "${apt_opts[@]}" update
+          apt-get "${apt_opts[@]}" install -y --no-install-recommends \
+            ca-certificates curl docker.io iproute2 libnghttp2-14 procps zstd
+
+          # Driver 580 predates CUDA 13.3; the CUDA 13.3 lane points the server at this
+          # forward-compat library. It installs under /usr/local/cuda-13.3/compat and is
+          # unused by the other lanes.
+          curl --fail --location --retry 5 --output /tmp/cuda-compat.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-compat-13-3_610.57.04-1ubuntu1_amd64.deb
+          echo "5150dbbe6376c29a53ec01730aa1b335f192d5965e95be71a448a719f10044a4  /tmp/cuda-compat.deb" |
+            sha256sum --check
+          apt-get "${apt_opts[@]}" install -y --no-install-recommends /tmp/cuda-compat.deb
+          rm -f /tmp/cuda-compat.deb
+
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          echo "$marker: ok" > /dev/ttyS0
+          SCRIPT
+
+          base="$(gcloud compute images describe-from-family "$BASE_IMAGE_FAMILY" \
+            --project="$BASE_IMAGE_PROJECT" --format='value(name)')"
+          test -n "$base"
+          hash="$( (echo "$BASE_IMAGE_PROJECT/$base"; cat "$RUNNER_TEMP/gpu-ci-image.sh") |
+            sha256sum | cut -c1-16)"
+          image="$IMAGE_FAMILY-$hash"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          {
+            echo "BASE_IMAGE=$base"
+            echo "IMAGE=$image"
+          } >> "$GITHUB_ENV"
+          if gcloud compute images describe "$image" \
+            --project="$GCP_PROJECT_ID" >/dev/null 2>&1; then
+            echo "Reusing $image"
+            echo "EXISTS=true" >> "$GITHUB_ENV"
+          else
+            echo "Building $image from $base"
+          fi
+
+      - name: Build VM image
+        if: env.EXISTS != 'true'
+        run: |
+          set -euo pipefail
+          zone=""
+          for candidate in $BUILDER_ZONES; do
+            if gcloud compute instances create "$BUILDER_NAME" \
+              --project="$GCP_PROJECT_ID" \
+              --zone="$candidate" \
+              --machine-type=e2-standard-4 \
+              --image="$BASE_IMAGE" \
+              --image-project="$BASE_IMAGE_PROJECT" \
+              --boot-disk-type=pd-balanced \
+              --max-run-duration=50m \
+              --instance-termination-action=DELETE \
+              --no-service-account \
+              --no-scopes \
+              --metadata=block-project-ssh-keys=TRUE,enable-oslogin=FALSE \
+              --metadata-from-file=startup-script="$RUNNER_TEMP/gpu-ci-image.sh"; then
+              zone="$candidate"
+              break
+            fi
+          done
+          test -n "$zone"
+          echo "BUILDER_ZONE=$zone" >> "$GITHUB_ENV"
+
+          deadline=$((SECONDS + 2400))
+          verdict=""
+          until [[ -n "$verdict" ]]; do
+            if (( SECONDS >= deadline )); then
+              echo "Image builder did not finish before the timeout" >&2
+              break
+            fi
+            sleep 15
+            serial="$(gcloud compute instances get-serial-port-output "$BUILDER_NAME" \
+              --project="$GCP_PROJECT_ID" --zone="$zone" || true)"
+            verdict="$(grep -o 'lupine-image-build: [a-z]*' <<<"$serial" | tail -n 1 || true)"
+          done
+          if [[ "$verdict" != 'lupine-image-build: ok' ]]; then
+            tail -n 200 <<<"$serial" >&2
+            exit 1
+          fi
+          gcloud compute instances stop "$BUILDER_NAME" \
+            --project="$GCP_PROJECT_ID" --zone="$zone"
+
+          # A concurrent run may have published the same image first.
+          gcloud compute images create "$IMAGE" \
+            --project="$GCP_PROJECT_ID" \
+            --source-disk="$BUILDER_NAME" \
+            --source-disk-zone="$zone" \
+            --family="$IMAGE_FAMILY" ||
+            gcloud compute images describe "$IMAGE" \
+              --project="$GCP_PROJECT_ID" >/dev/null
+
+      - name: Delete image builder
+        if: always() && env.BUILDER_ZONE != ''
+        run: |
+          gcloud compute instances delete "$BUILDER_NAME" \
+            --project="$GCP_PROJECT_ID" --zone="$BUILDER_ZONE" --quiet
+
+      - name: Delete stale VM images
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          cutoff="$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%S)"
+          gcloud compute images list \
+            --project="$GCP_PROJECT_ID" \
+            --no-standard-images \
+            --filter="family=$IMAGE_FAMILY AND creationTimestamp<'$cutoff' AND name!=$IMAGE" \
+            --format='value(name)' |
+            xargs -r gcloud compute images delete --project="$GCP_PROJECT_ID" --quiet
+
+  gpu-integration:
+    name: ${{ matrix.name }} GPU integration on GCE L4
+    needs: vm-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: cuda13-3
+            name: CUDA 13.3
+            cuda_version: 13.3.1
+            client_image: nvidia/cuda:13.3.1-devel-ubuntu24.04
+            samples_ref: v13.3
+            pytorch_index_url: https://download.pytorch.org/whl/cu132
+            server_ld_library_path: /usr/local/cuda-13.3/compat
+          - label: cuda12-4
+            name: CUDA 12.4
+            cuda_version: 12.4.1
+            client_image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+            samples_ref: v12.4.1
+            pytorch_index_url: https://download.pytorch.org/whl/cu124
+            server_ld_library_path: ""
+          - label: cuda11-8
+            name: CUDA 11.8
+            cuda_version: 11.8.0
+            client_image: nvidia/cuda:11.8.0-devel-ubuntu22.04
+            samples_ref: v11.8
+            pytorch_index_url: https://download.pytorch.org/whl/cu118
+            server_ld_library_path: ""
+
+    env:
+      GCP_PROJECT_ID: kevmo314
+      GCP_WORKLOAD_IDENTITY_PROVIDER: projects/272419586516/locations/global/workloadIdentityPools/lupine-github/providers/github
+      GCP_SERVICE_ACCOUNT: lupine-gpu-ci@kevmo314.iam.gserviceaccount.com
+      GCP_BUILD_CACHE_BUCKET: kevmo314-lupine-gpu-integration-cache
+      INTEGRATION_IMAGE_CACHE_VERSION: v2
+      GCP_ZONE: us-central1-a
+      GCP_FALLBACK_ZONES: >-
+        us-central1-c us-central1-b
+        us-west1-a us-west1-b us-west1-c
+        us-east1-b us-east1-c us-east1-d
+        us-east4-a us-east4-c
+        us-west4-a us-west4-c
+        northamerica-northeast1-b northamerica-northeast1-c
+        northamerica-northeast2-a northamerica-northeast2-b
+        europe-west1-b europe-west1-c
+      GCP_NETWORK: default
+      MACHINE_TYPE: g2-standard-8
+      VM_IMAGE: ${{ needs.vm-image.outputs.image }}
+      VM_MAX_RUN_DURATION: 260m
+      COMPLIANCE_TIMEOUT: 240m
+      CUDA_SAMPLE_TIMEOUT: 120
+      CUDA_LONG_SAMPLE_TIMEOUT: 600
+      # Match the eight vCPUs on g2-standard-8. Higher fan-out runs too many
+      # independent CUDA contexts on one L4 and causes device-unavailable
+      # cascades in otherwise passing cuBLAS and PyTorch tests.
+      CUDA_SAMPLE_JOBS: 8
+      SSH_COMMAND_TIMEOUT: 120
+      SERVER_LD_LIBRARY_PATH: ${{ matrix.server_ld_library_path }}
+      USE_SPOT: "false"
+      VM_NAME: lupine-gpu-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
+      VM_TAG: lupine-gpu-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}
+      FIREWALL_ALLOW_RULE: lupine-gpu-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}-allow
+      FIREWALL_DENY_RULE: lupine-gpu-ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.label }}-deny
+      CLIENT_IMAGE: lupine-gpu-integration:${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      # google-github-actions/auth writes its generated ADC file into the
+      # workspace. Move it before Docker packages the pull request checkout so
+      # fork-controlled .dockerignore changes cannot add the credential file to
+      # the remote build context.
+      - name: Move Google Cloud credentials outside the build context
+        run: |
+          set -euo pipefail
+          credentials_path="${GOOGLE_GHA_CREDS_PATH:?Google auth did not create credentials}"
+          relocated_path="$RUNNER_TEMP/$(basename "$credentials_path")"
+          mv "$credentials_path" "$relocated_path"
+          chmod 600 "$relocated_path"
+          {
+            echo "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=$relocated_path"
+            echo "GOOGLE_APPLICATION_CREDENTIALS=$relocated_path"
+            echo "GOOGLE_GHA_CREDS_PATH=$relocated_path"
+            echo "LUPINE_GCP_CREDS_PATH=$relocated_path"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure GCS build cache lifecycle
+        if: github.event_name != 'pull_request' && matrix.label == 'cuda13-3'
+        run: |
+          set -euo pipefail
+          bucket_name="${GCP_BUILD_CACHE_BUCKET#gs://}"
+          bucket_name="${bucket_name%/}"
+          lifecycle_file="$RUNNER_TEMP/gpu-integration-cache-lifecycle.json"
+          cat > "$lifecycle_file" <<'JSON'
+          {
+            "rule": [
+              {
+                "action": { "type": "Delete" },
+                "condition": {
+                  "daysSinceCustomTime": 7,
+                  "matchesPrefix": ["gpu-integration/binaries/", "gpu-integration/images/"]
+                }
+              }
+            ]
+          }
+          JSON
+          gcloud storage buckets update "gs://$bucket_name" \
+            --lifecycle-file="$lifecycle_file"
+
+      - name: Prepare SSH key and runner allowlist
+        run: |
+          set -euo pipefail
+          ssh_dir="$RUNNER_TEMP/gce-ssh"
+          mkdir -p "$ssh_dir"
+          ssh-keygen -t ed25519 -N '' -C "gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -f "$ssh_dir/id_ed25519"
+          chmod 700 "$ssh_dir"
+          chmod 600 "$ssh_dir/id_ed25519"
+
+          runner_ip="$(curl -fsS https://api.ipify.org)"
+          test -n "$runner_ip"
+
+          {
+            echo "SSH_DIR=$ssh_dir"
+            echo "RUNNER_IP=$runner_ip"
+          } >> "$GITHUB_ENV"
+
+      - name: Create locked-down firewall rules
+        run: |
+          set -euo pipefail
+
+          create_firewall_rule() {
+            local name="$1"
+            local action="$2"
+            local priority="$3"
+            local rules="$4"
+            local source_ranges="$5"
+
+            gcloud compute firewall-rules create "$name" \
+              --project="$GCP_PROJECT_ID" \
+              --network="$GCP_NETWORK" \
+              --direction=INGRESS \
+              --priority="$priority" \
+              --action="$action" \
+              --rules="$rules" \
+              --source-ranges="$source_ranges" \
+              --target-tags="$VM_TAG"
+          }
+
+          create_firewall_rule \
+            "$FIREWALL_ALLOW_RULE" \
+            ALLOW \
+            800 \
+            tcp:22 \
+            "$RUNNER_IP/32"
+
+          create_firewall_rule \
+            "$FIREWALL_DENY_RULE" \
+            DENY \
+            900 \
+            tcp:1-65535,udp:1-65535,icmp,esp,ah,sctp \
+            0.0.0.0/0
+
+      - name: Create L4 server VM
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2206
+          fallback_zones=($GCP_FALLBACK_ZONES)
+          candidate_zones=("$GCP_ZONE" "${fallback_zones[@]}")
+
+          vm_ip=""
+          selected_zone=""
+          for zone in "${candidate_zones[@]}"; do
+            echo "Creating $MACHINE_TYPE in $zone"
+            create_args=(
+              "$VM_NAME"
+              "--project=$GCP_PROJECT_ID"
+              "--zone=$zone"
+              "--machine-type=$MACHINE_TYPE"
+              "--network=$GCP_NETWORK"
+              "--tags=$VM_TAG"
+              "--image=$VM_IMAGE"
+              "--image-project=$GCP_PROJECT_ID"
+              "--boot-disk-size=100GB"
+              "--boot-disk-type=pd-balanced"
+              "--maintenance-policy=TERMINATE"
+              "--max-run-duration=$VM_MAX_RUN_DURATION"
+              "--instance-termination-action=DELETE"
+              "--no-service-account"
+              "--no-scopes"
+              "--metadata=block-project-ssh-keys=TRUE,enable-oslogin=FALSE,ssh-keys=gha:$(cat "$SSH_DIR/id_ed25519.pub")"
+              "--shielded-vtpm"
+              "--shielded-integrity-monitoring"
+              "--no-shielded-secure-boot"
+            )
+
+            if [[ "$USE_SPOT" == "true" ]]; then
+              create_args+=("--provisioning-model=SPOT")
+            fi
+
+            if vm_ip="$(gcloud compute instances create "${create_args[@]}" \
+              --format='value(networkInterfaces[0].accessConfigs[0].natIP)')"; then
+              selected_zone="$zone"
+              break
+            fi
+
+            echo "Could not create $MACHINE_TYPE in $zone; trying next candidate zone" >&2
+            gcloud compute instances delete "$VM_NAME" \
+              --project="$GCP_PROJECT_ID" \
+              --zone="$zone" \
+              --quiet >/dev/null 2>&1 || true
+          done
+
+          test -n "$vm_ip"
+          test -n "$selected_zone"
+          {
+            echo "VM_IP=$vm_ip"
+            echo "GCP_ZONE=$selected_zone"
+          } >> "$GITHUB_ENV"
+
+      - name: Write integration Dockerfiles
+        run: |
+          cat > "$RUNNER_TEMP/gpu-integration-dependencies.Dockerfile" <<'EOF'
+          # syntax=docker/dockerfile:1.7
+
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+
+          ARG CUDA_SAMPLES_ARCH
+          ARG CUDA_SAMPLES_REF
+          ARG PYTORCH_INDEX_URL
+          ENV DEBIAN_FRONTEND=noninteractive \
+              PIP_NO_CACHE_DIR=1 \
+              CUDA_HOME=/usr/local/cuda \
+              CUDA_LIB_DIR=/usr/local/cuda/lib64 \
+              CUDA_SAMPLES_DIR=/opt/cuda-samples-src \
+              CUDA_SAMPLES_BUILD_DIR=/opt/cuda-samples-build \
+              CUDA_SAMPLES_ARCH=${CUDA_SAMPLES_ARCH} \
+              CCACHE_DIR=/opt/lupine/ccache \
+              CCACHE_BASEDIR=/src \
+              CCACHE_COMPILERCHECK=content \
+              CCACHE_COMPRESS=true \
+              PATH=/usr/local/cuda/bin:$PATH
+
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                bash \
+                build-essential \
+                ca-certificates \
+                ccache \
+                cmake \
+                curl \
+                freeglut3-dev \
+                git \
+                gzip \
+                libfreeimage-dev \
+                libgl-dev \
+                libglu1-mesa-dev \
+                libnghttp2-dev \
+                libx11-dev \
+                libxi-dev \
+                libxmu-dev \
+                llvm-14-dev \
+                ninja-build \
+                openssh-client \
+                python3 \
+                python3-dev \
+                python3-pip \
+                python3-venv \
+              && rm -rf /var/lib/apt/lists/*
+
+          RUN bash <<'SCRIPT'
+          set -euo pipefail
+
+          git clone --branch "$CUDA_SAMPLES_REF" --depth 1 \
+            https://github.com/NVIDIA/cuda-samples.git "$CUDA_SAMPLES_DIR"
+          git config --global --add safe.directory "$CUDA_SAMPLES_DIR"
+
+          if [[ -n "$CUDA_SAMPLES_ARCH" ]]; then
+            find "$CUDA_SAMPLES_DIR" -name CMakeLists.txt -exec sed -i -E \
+              "s/set\(CMAKE_CUDA_ARCHITECTURES ([0-9 ]* )?$CUDA_SAMPLES_ARCH( [0-9 ]*)?\)/set(CMAKE_CUDA_ARCHITECTURES $CUDA_SAMPLES_ARCH)/" {} +
+          fi
+
+          export LLVM_HOME=/usr/lib/llvm-14
+          if [[ -f "$CUDA_SAMPLES_DIR/CMakeLists.txt" && ( -d "$CUDA_SAMPLES_DIR/cpp" || -d "$CUDA_SAMPLES_DIR/Samples" ) ]]; then
+            cmake -S "$CUDA_SAMPLES_DIR" -B "$CUDA_SAMPLES_BUILD_DIR" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+              -DENABLE_CUDA_C_LINKING_SAMPLE=1
+            cmake --build "$CUDA_SAMPLES_BUILD_DIR" --parallel "$(nproc)"
+          else
+            make -C "$CUDA_SAMPLES_DIR" -j"$(nproc)" EXTRA_NVCCFLAGS="--cudart shared" ${CUDA_SAMPLES_ARCH:+SMS="$CUDA_SAMPLES_ARCH"}
+          fi
+          SCRIPT
+
+          # cuPQC ships outside the toolkit; its device-side archives and
+          # headers are all the samples need, and 0.4.0 is the release the
+          # pinned CUDALibrarySamples ref builds against.
+          ENV CUPQC_HOME=/opt/cupqc-sdk
+          RUN mkdir -p "$CUPQC_HOME" && \
+              curl -fsSL https://developer.nvidia.com/downloads/compute/cupqc/downloads/secure/cupqc-sdk-0.4.0-x86_64.tar.gz \
+                | tar xz -C "$CUPQC_HOME" --strip-components=1
+
+          # Python setup is part of the dependency image, before the source copy.
+          COPY test/run_cuda_python_tests.sh /opt/lupine/run_cuda_python_tests.sh
+          RUN python3 -m venv /opt/venv-pytorch && \
+              /opt/venv-pytorch/bin/pip install --upgrade pip && \
+              /opt/venv-pytorch/bin/pip install numpy && \
+              /opt/venv-pytorch/bin/pip install --index-url "$PYTORCH_INDEX_URL" torch
+          ENV PYTHON_BIN=/opt/venv-pytorch/bin/python \
+              CUDA_PYTHON_DIR=/opt/cuda-python
+          RUN CUDA_PYTHON_SETUP_ONLY=1 bash /opt/lupine/run_cuda_python_tests.sh
+
+          # CUDALibrarySamples are built once here; samples the lane's toolkit
+          # cannot build are reported as SKIP:build-failed by the run step. The
+          # cuSPARSELt ones need the PyTorch wheel's cuSPARSELt, so they build
+          # after it, from whichever directory that release installs into.
+          COPY test/run_cuda_library_samples.sh /opt/lupine/test/run_cuda_library_samples.sh
+          COPY test/cuda-library-samples/patches /opt/lupine/test/cuda-library-samples/patches
+          RUN bash <<'SCRIPT'
+          set -euo pipefail
+          site="$("$PYTHON_BIN" -c 'import site; print(site.getsitepackages()[0])')"
+          for header in "$site"/*/include/cusparseLt.h "$site"/*/*/include/cusparseLt.h; do
+            [[ -e "$header" ]] || continue
+            export CUSPARSELT_HOME="$(dirname "$(dirname "$header")")"
+            break
+          done
+          LIBRARY_SAMPLES_DIR=/opt/cuda-library-samples LIBRARY_SAMPLES_ARCH="$CUDA_SAMPLES_ARCH" \
+            BUILD_ONLY=1 bash /opt/lupine/test/run_cuda_library_samples.sh
+          SCRIPT
+          EOF
+          cat > "$RUNNER_TEMP/gpu-integration.Dockerfile" <<'EOF'
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          WORKDIR /src
+          COPY . /src
+          EOF
+
+      - name: Wait for SSH and NVIDIA driver
+        run: |
+          set -euo pipefail
+          ssh_base=(
+            ssh
+            -i "$SSH_DIR/id_ed25519"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=accept-new
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts"
+            -o ConnectTimeout=10
+            "gha@$VM_IP"
+          )
+
+          for _ in $(seq 1 120); do
+            if "${ssh_base[@]}" 'echo ready' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 5
+          done
+
+          "${ssh_base[@]}" '
+            deadline=$((SECONDS + 1200))
+            until command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "NVIDIA driver did not become ready before the timeout" >&2
+                exit 1
+              fi
+              sleep 15
+            done
+
+            deadline=$((SECONDS + 300))
+            until sudo docker info >/dev/null 2>&1; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "Docker did not start before the timeout" >&2
+                sudo systemctl status --no-pager docker.service || true
+                exit 1
+              fi
+              sleep 5
+            done
+            sudo usermod -aG docker gha
+          '
+
+          arch="$("${ssh_base[@]}" 'nvidia-smi --query-gpu=compute_cap --format=csv,noheader' \
+            | tr -d '. ' | sort -u | xargs)"
+          test -n "$arch"
+          echo "CUDA_SAMPLES_ARCH=$arch" >> "$GITHUB_ENV"
+
+      - name: Restore integration dependency image from GCS
+        run: |
+          set -euo pipefail
+          ssh_base=(
+            ssh
+            -i "$SSH_DIR/id_ed25519"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts"
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=4
+            "gha@$VM_IP"
+          )
+
+          dockerfile_sha="$(sha256sum "$RUNNER_TEMP/gpu-integration-dependencies.Dockerfile" | cut -d' ' -f1)"
+          cache_inputs="$(
+            {
+              printf '%s\n' "$INTEGRATION_IMAGE_CACHE_VERSION" \
+                "${{ matrix.client_image }}" "${{ matrix.samples_ref }}" \
+                "${{ matrix.pytorch_index_url }}" "$CUDA_SAMPLES_ARCH" "$dockerfile_sha"
+              sha256sum test/run_cuda_library_samples.sh test/run_cuda_python_tests.sh
+              sha256sum test/cuda-library-samples/patches/*.patch
+              "${ssh_base[@]}" "sudo docker version --format '{{.Server.Version}}'"
+            } | sha256sum | cut -d' ' -f1
+          )"
+          dependency_image="lupine-integration-deps:${{ matrix.label }}-$cache_inputs"
+          cache_prefix="gpu-integration/images/$INTEGRATION_IMAGE_CACHE_VERSION/cuda-${{ matrix.cuda_version }}/sm-$CUDA_SAMPLES_ARCH"
+          cache_uri="gs://$GCP_BUILD_CACHE_BUCKET/$cache_prefix/inputs-$cache_inputs.tar.zst"
+          cache_hit=false
+          start=$SECONDS
+          # The VM reads the archive straight from GCS, in region, instead of
+          # through this runner. It gets a token downscoped to reading this
+          # cache prefix, on stdin so it never reaches a command line.
+          if gcloud storage objects describe "$cache_uri" >/dev/null 2>&1; then
+            boundary="$(jq -cn --arg bucket "$GCP_BUILD_CACHE_BUCKET" --arg prefix "$cache_prefix" '{
+              accessBoundary: {accessBoundaryRules: [{
+                availablePermissions: ["inRole:roles/storage.objectViewer"],
+                availableResource: "//storage.googleapis.com/projects/_/buckets/\($bucket)",
+                availabilityCondition: {expression:
+                  "resource.name.startsWith(\"projects/_/buckets/\($bucket)/objects/\($prefix)/\")"}
+              }]}}')"
+            read_token="$(curl -fsS https://sts.googleapis.com/v1/token \
+              --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+              --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:access_token \
+              --data-urlencode requested_token_type=urn:ietf:params:oauth:token-type:access_token \
+              --data-urlencode "subject_token=$(gcloud auth print-access-token)" \
+              --data-urlencode "options=$boundary" | jq -r .access_token)"
+            echo "::add-mask::$read_token"
+            # docker load applies layers one at a time at a fraction of disk
+            # speed, so the cache is the whole data root, unpacked in place.
+            # zstd's frame checksum catches a corrupt or truncated download.
+            restore_script='
+              set -euo pipefail
+              read -r token
+              sudo systemctl stop docker.socket docker
+              sudo rm -rf /var/lib/docker
+              sudo mkdir -m 710 /var/lib/docker
+              status=0
+              curl -fsS -H @<(printf "Authorization: Bearer %s\n" "$token") "$1" | zstd -dc |
+                sudo tar -C /var/lib/docker --numeric-owner --xattrs --xattrs-include="*" -xf - ||
+                status=$?
+              if [[ "$status" != 0 ]]; then
+                sudo rm -rf /var/lib/docker
+                sudo mkdir -m 710 /var/lib/docker
+              fi
+              sudo systemctl start docker
+              [[ "$status" == 0 ]] && sudo docker image inspect "$2" >/dev/null
+            '
+            if printf '%s\n' "$read_token" | "${ssh_base[@]}" \
+              "bash -c $(printf %q "$restore_script") restore" \
+              "'https://storage.googleapis.com/$GCP_BUILD_CACHE_BUCKET/$cache_prefix/inputs-$cache_inputs.tar.zst'" \
+              "'$dependency_image'"; then
+              cache_hit=true
+              gcloud storage objects update "$cache_uri" \
+                --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || \
+                echo "Could not refresh dependency-image cache lifetime: $cache_uri" >&2
+              echo "Restored dependency image in $((SECONDS - start))s: $cache_uri"
+            fi
+          fi
+          if [[ "$cache_hit" != "true" ]]; then
+            echo "No valid dependency image at $cache_uri; building it from source"
+          fi
+          {
+            echo "INTEGRATION_IMAGE_CACHE_HIT=$cache_hit"
+            echo "INTEGRATION_IMAGE_CACHE_URI=$cache_uri"
+            echo "DEPENDENCY_IMAGE=$dependency_image"
+          } >> "$GITHUB_ENV"
+
+      - name: Build ${{ matrix.name }} client image on L4 VM
+        run: |
+          set -euo pipefail
+          # The docker CLI reaches the VM daemon over SSH and ships only the
+          # build context, so the multi-GB image never crosses the wire. It
+          # takes SSH options from ~/.ssh/config only.
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          cat >> ~/.ssh/config <<EOF
+          Host lupine-gpu-vm
+            HostName $VM_IP
+            User gha
+            IdentityFile $SSH_DIR/id_ed25519
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile $SSH_DIR/known_hosts
+            ServerAliveInterval 15
+            ServerAliveCountMax 4
+          EOF
+
+          start=$SECONDS
+          if [[ "$INTEGRATION_IMAGE_CACHE_HIT" != "true" ]]; then
+            DOCKER_HOST=ssh://lupine-gpu-vm docker build \
+              --progress=plain \
+              --file "$RUNNER_TEMP/gpu-integration-dependencies.Dockerfile" \
+              --tag "$DEPENDENCY_IMAGE" \
+              --build-arg "BASE_IMAGE=${{ matrix.client_image }}" \
+              --build-arg "CUDA_SAMPLES_REF=${{ matrix.samples_ref }}" \
+              --build-arg "PYTORCH_INDEX_URL=${{ matrix.pytorch_index_url }}" \
+              --build-arg "CUDA_SAMPLES_ARCH=$CUDA_SAMPLES_ARCH" \
+              .
+          fi
+          # Always layer the current checkout over the dependency image.
+          # The cache excludes /src and Lupine build outputs.
+          DOCKER_HOST=ssh://lupine-gpu-vm docker build \
+            --progress=plain \
+            --file "${RUNNER_TEMP}/gpu-integration.Dockerfile" \
+            --tag "$CLIENT_IMAGE" \
+            --build-arg "BASE_IMAGE=$DEPENDENCY_IMAGE" \
+            .
+          echo "Built $CLIENT_IMAGE on L4 VM in $((SECONDS - start))s"
+
+      - name: Refresh Google Cloud credentials for cache upload
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && env.INTEGRATION_IMAGE_CACHE_HIT != 'true'
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Save integration dependency image to GCS
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && env.INTEGRATION_IMAGE_CACHE_HIT != 'true'
+        run: |
+          set -euo pipefail
+          ssh_base=(
+            ssh
+            -i "$SSH_DIR/id_ed25519"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts"
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=4
+            "gha@$VM_IP"
+          )
+
+          # Docker must be stopped for a consistent data root. The client
+          # image built over it is small and its tag is never reused.
+          "${ssh_base[@]}" bash -s <<'REMOTE' |
+          set -euo pipefail
+          sudo docker builder prune -af >/dev/null
+          sudo systemctl stop docker.socket docker
+          status=0
+          sudo tar -C /var/lib/docker --numeric-owner --xattrs --xattrs-include='*' -cf - . |
+            zstd -T0 -3 -q || status=$?
+          sudo systemctl start docker
+          exit "$status"
+          REMOTE
+            gcloud storage cp - "$INTEGRATION_IMAGE_CACHE_URI" \
+              --content-type=application/zstd \
+              --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Saved integration dependency image to $INTEGRATION_IMAGE_CACHE_URI"
+
+      - name: Run ${{ matrix.name }} client inside L4 VM
+        run: |
+          set -euo pipefail
+
+          if [[ -e /dev/nvidiactl || -e /dev/nvidia0 ]]; then
+            echo "local NVIDIA device is visible on the GitHub runner; client/server separation is invalid" >&2
+            exit 1
+          fi
+          if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+            echo "local NVIDIA GPU is visible on the GitHub runner; client/server separation is invalid" >&2
+            exit 1
+          fi
+
+          ssh_base=(
+            ssh
+            -i "$SSH_DIR/id_ed25519"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts"
+            -o ConnectTimeout=15
+            -o ServerAliveInterval=15
+            -o ServerAliveCountMax=4
+            "gha@$VM_IP"
+          )
+          scp_base=(
+            scp
+            -i "$SSH_DIR/id_ed25519"
+            -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="$SSH_DIR/known_hosts"
+          )
+
+          remote_ssh="/home/gha/lupine-ssh"
+          remote_results="/home/gha/lupine-results-${{ matrix.label }}"
+          "${ssh_base[@]}" "rm -rf '$remote_results' '$remote_ssh'; mkdir -p '$remote_results' '$remote_ssh'"
+          "${scp_base[@]}" "$SSH_DIR/id_ed25519" "$SSH_DIR/known_hosts" "gha@$VM_IP:$remote_ssh/"
+          "${ssh_base[@]}" "chmod 700 '$remote_ssh'; chmod 600 '$remote_ssh/id_ed25519'"
+
+          remote_status=0
+          "${ssh_base[@]}" \
+            "CLIENT_IMAGE='$CLIENT_IMAGE' CUDA_SAMPLE_JOBS='$CUDA_SAMPLE_JOBS' CUDA_SAMPLE_TIMEOUT='$CUDA_SAMPLE_TIMEOUT' CUDA_LONG_SAMPLE_TIMEOUT='$CUDA_LONG_SAMPLE_TIMEOUT' SSH_COMMAND_TIMEOUT='$SSH_COMMAND_TIMEOUT' COMPLIANCE_TIMEOUT='$COMPLIANCE_TIMEOUT' SERVER_LD_LIBRARY_PATH='$SERVER_LD_LIBRARY_PATH' MATRIX_LABEL='${{ matrix.label }}' GITHUB_RUN_ID='${GITHUB_RUN_ID:-local}' GITHUB_RUN_ATTEMPT='${GITHUB_RUN_ATTEMPT:-1}' bash -s" <<'REMOTE' || remote_status=$?
+          set -euo pipefail
+          sudo docker run --rm \
+            --add-host=host.docker.internal:host-gateway \
+            -e CUDA_SAMPLE_JOBS="$CUDA_SAMPLE_JOBS" \
+            -e CUDA_SAMPLE_TIMEOUT="$CUDA_SAMPLE_TIMEOUT" \
+            -e CUDA_LONG_SAMPLE_TIMEOUT="$CUDA_LONG_SAMPLE_TIMEOUT" \
+            -e SSH_COMMAND_TIMEOUT="$SSH_COMMAND_TIMEOUT" \
+            -e COMPLIANCE_TIMEOUT="$COMPLIANCE_TIMEOUT" \
+            -e SERVER_LD_LIBRARY_PATH="$SERVER_LD_LIBRARY_PATH" \
+            -e SERVER_HOST=host.docker.internal \
+            -e SERVER_USER=gha \
+            -e SERVER_SSH_TARGET=gha@host.docker.internal \
+            -e MATRIX_LABEL="$MATRIX_LABEL" \
+            -e GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            -e GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            -v /home/gha/lupine-ssh:/ssh:ro \
+            -v /home/gha/lupine-results-"$MATRIX_LABEL":/results \
+            "$CLIENT_IMAGE" \
+            bash -lc '
+              # This script reaches the container inside a single-quoted
+              # command, so every quote below is a double quote: an apostrophe
+              # would end the command mid-script.
+              set -euo pipefail
+              if [[ -e /dev/nvidiactl || -e /dev/nvidia0 ]]; then
+                echo "NVIDIA device is visible inside the client container; client/server separation is invalid" >&2
+                exit 1
+              fi
+              if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+                echo "NVIDIA GPU is visible inside the client container; client/server separation is invalid" >&2
+                exit 1
+              fi
+
+              mkdir -p /tmp/lupine-ssh
+              cp /ssh/id_ed25519 /tmp/lupine-ssh/id_ed25519
+              cp /ssh/known_hosts /tmp/lupine-ssh/known_hosts
+              chmod 700 /tmp/lupine-ssh
+              chmod 600 /tmp/lupine-ssh/id_ed25519
+
+              export CUDA_HOME=/usr/local/cuda
+              export CUDA_LIB_DIR=/usr/local/cuda/lib64
+              export PATH=/usr/local/cuda/bin:$PATH
+              export REPO_ROOT=/src
+              export LUPINE_BUILD_DIR=/tmp/lupine-build
+              export CCACHE_DIR=/tmp/lupine-ccache
+              mkdir -p "$LUPINE_BUILD_DIR" "$CCACHE_DIR"
+              export CCACHE_BASEDIR=/src
+              export CCACHE_COMPILERCHECK=content
+              export CCACHE_COMPRESS=true
+              export LUPINE_LIB="$LUPINE_BUILD_DIR/libcuda.so.1"
+              export SERVER_LOCAL_BIN="$LUPINE_BUILD_DIR/lupine_driver_server"
+              export SERVER_REMOTE_BIN="/tmp/lupine-driver-server-${MATRIX_LABEL}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              export SSH_OPTS="-o ControlMaster=auto -o ControlPersist=60 -o ControlPath=/tmp/lupine-ssh/control-%C -i /tmp/lupine-ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+              export SAMPLE_TIMEOUT="$CUDA_SAMPLE_TIMEOUT"
+              export LONG_SAMPLE_TIMEOUT="$CUDA_LONG_SAMPLE_TIMEOUT"
+              export CUDA_SAMPLES_DIR=/opt/cuda-samples-src
+              export CUDA_SAMPLES_BUILD_DIR=/opt/cuda-samples-build
+              export CUDA_PYTHON_DIR=/opt/cuda-python
+              export LIBRARY_SAMPLES_DIR=/opt/cuda-library-samples
+
+              export PYTHON_BIN=/opt/venv-pytorch/bin/python
+              export CUDA_PYTHON_INSTALL=0
+              # PyTorch brings an NCCL wheel; the NCCL shim builds against it
+              # and its test links it.
+              export NCCL_HOME="$("$PYTHON_BIN" -c "import nvidia.nccl; print(list(nvidia.nccl.__path__)[0])")"
+              # Its nvSHMEM wheel, where that torch build carries one, does the
+              # same for the nvSHMEM shim and its test.
+              export NVSHMEM_HOME="$("$PYTHON_BIN" -c "import nvidia.nvshmem; print(list(nvidia.nvshmem.__path__)[0])" 2>/dev/null || true)"
+              # The cuSPARSELt library samples load its cuSPARSELt wheel at run
+              # time, from whichever directory the release installs into:
+              # nvidia/cu13 for the CUDA 13 wheels, nvidia/cusparselt from 0.7,
+              # and a top-level cusparselt before that.
+              export CUSPARSELT_HOME=""
+              nvidia_dir="$(dirname "$NCCL_HOME")"
+              for header in "$nvidia_dir"/*/include/cusparseLt.h \
+                            "$(dirname "$nvidia_dir")"/*/include/cusparseLt.h; do
+                [[ -e "$header" ]] || continue
+                CUSPARSELT_HOME="$(dirname "$(dirname "$header")")"
+                break
+              done
+
+              cmake -S /src -B "$LUPINE_BUILD_DIR" \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCUDAToolkit_ROOT="$CUDA_HOME" \
+                -DCMAKE_LIBRARY_PATH="$CUDA_HOME/lib64/stubs" \
+                -DLUPINE_NCCL_INCLUDE_DIR="$NCCL_HOME/include" \
+                ${NVSHMEM_HOME:+-DLUPINE_NVSHMEM_INCLUDE_DIR="$NVSHMEM_HOME/include"} \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+              cmake --build "$LUPINE_BUILD_DIR" --parallel \
+                --target lupine_cuda_client lupine_nccl_client ${NVSHMEM_HOME:+lupine_nvshmem_client} lupine_nvml_client lupine_driver_server
+              ln -sf libcuda.so.1 "$LUPINE_BUILD_DIR/libcuda.so"
+              ln -sf libnvidia-ml.so.1 "$LUPINE_BUILD_DIR/libnvidia-ml.so"
+
+              # shellcheck disable=SC2206
+              ssh_args=($SSH_OPTS)
+              timeout --kill-after=5s "$SSH_COMMAND_TIMEOUT" \
+                scp -q "${ssh_args[@]}" "$SERVER_LOCAL_BIN" \
+                  "$SERVER_SSH_TARGET:$SERVER_REMOTE_BIN"
+
+              # The server loads the NVIDIA libnccl by SONAME for the NCCL shim;
+              # send the copy from this lane. The client search path stays
+              # separate below.
+              server_runtime_dir="${SERVER_REMOTE_BIN}-runtime"
+              timeout --kill-after=5s "$SSH_COMMAND_TIMEOUT" \
+                ssh "${ssh_args[@]}" "$SERVER_SSH_TARGET" "mkdir -p $server_runtime_dir"
+              timeout --kill-after=5s "$SSH_COMMAND_TIMEOUT" \
+                scp -q "${ssh_args[@]}" "$NCCL_HOME"/lib/libnccl.so.* \
+                  "$SERVER_SSH_TARGET:$server_runtime_dir/"
+              export SERVER_LD_LIBRARY_PATH="${SERVER_LD_LIBRARY_PATH:+$SERVER_LD_LIBRARY_PATH:}$server_runtime_dir"
+
+              # This sample hard-codes GPUs {0, 1}, while the GCE lane exposes
+              # one L4. Keep it enabled for two-GPU runs outside this workflow.
+              export LIBRARY_SAMPLES_SKIP_LIST="cuFFT/3d_mgpu_c2c/bin/3d_mgpu_c2c_example"
+              export INTEGRATION_RESULTS_DIR="/results/test/integration/results/$(date +%Y%m%d-%H%M%S)"
+              mkdir -p "$INTEGRATION_RESULTS_DIR"
+              cmake -S /src/test/integration -B /tmp/lupine-integration-ctest
+              # Configuration can outlive ControlPersist. Establish one master
+              # before the eight CTest workers open their first SSH sessions.
+              timeout --kill-after=5s "$SSH_COMMAND_TIMEOUT" \
+                ssh "${ssh_args[@]}" "$SERVER_SSH_TARGET" true
+              timeout --kill-after=30s "$COMPLIANCE_TIMEOUT" \
+                ctest --test-dir /tmp/lupine-integration-ctest \
+                  --parallel "$CUDA_SAMPLE_JOBS" \
+                  --output-on-failure \
+                  --output-log "$INTEGRATION_RESULTS_DIR/ctest.log" \
+                  --output-junit "$INTEGRATION_RESULTS_DIR/junit.xml"
+            '
+          REMOTE
+
+          results_tgz="$RUNNER_TEMP/gpu-results-${{ matrix.label }}.tgz"
+          "${ssh_base[@]}" "cd '$remote_results' && [ -d test ] && tar -czf - test || true" > "$results_tgz"
+          if [[ -s "$results_tgz" ]]; then
+            tar -xzf "$results_tgz"
+          fi
+
+          exit "$remote_status"
+
+      - name: Publish integration test results
+        if: always()
+        uses: dorny/test-reporter@v3
+        with:
+          name: GPU integration (${{ matrix.label }})
+          path: test/integration/results/*/junit.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+      - name: Upload integration results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gpu-integration-results-${{ matrix.label }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: test/integration/results/
+          if-no-files-found: ignore
+
+      - name: Refresh Google Cloud credentials for cleanup
+        if: always()
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+      - name: Tear down GCE resources
+        if: always()
+        run: |
+          set -euo pipefail
+
+          # shellcheck disable=SC2206
+          fallback_zones=($GCP_FALLBACK_ZONES)
+          candidate_zones=("$GCP_ZONE" "${fallback_zones[@]}")
+
+          delete_pids=()
+          for zone in "${candidate_zones[@]}"; do
+            gcloud compute instances delete "$VM_NAME" \
+              --project="$GCP_PROJECT_ID" \
+              --zone="$zone" \
+              --quiet &
+            delete_pids+=("$!")
+          done
+
+          for rule in "$FIREWALL_ALLOW_RULE" "$FIREWALL_DENY_RULE"; do
+            gcloud compute firewall-rules delete "$rule" \
+              --project="$GCP_PROJECT_ID" \
+              --quiet &
+            delete_pids+=("$!")
+          done
+
+          for pid in "${delete_pids[@]}"; do
+            wait "$pid" || true
+          done
+
+          leftovers=0
+          check_pids=()
+          for zone in "${candidate_zones[@]}"; do
+            (! gcloud compute instances describe "$VM_NAME" \
+              --project="$GCP_PROJECT_ID" \
+              --zone="$zone" >/dev/null 2>&1) &
+            check_pids+=("$!")
+          done
+
+          for rule in "$FIREWALL_ALLOW_RULE" "$FIREWALL_DENY_RULE"; do
+            (! gcloud compute firewall-rules describe "$rule" \
+              --project="$GCP_PROJECT_ID" >/dev/null 2>&1) &
+            check_pids+=("$!")
+          done
+
+          for pid in "${check_pids[@]}"; do
+            if ! wait "$pid"; then
+              leftovers=1
+            fi
+          done
+
+          exit "$leftovers"
+
+      - name: Remove relocated Google Cloud credentials
+        if: always()
+        run: rm -f -- "$LUPINE_GCP_CREDS_PATH"
