@@ -62,9 +62,8 @@ impl From<io::Error> for ShimError {
     }
 }
 
-fn olgp_lines(paths: &ShimPaths) -> [PathBuf; 3] {
+fn olgp_lines(paths: &ShimPaths) -> [PathBuf; 2] {
     [
-        paths.lib_dir.join("libolgp_driver.so"),
         paths.lib_dir.join("libcuda.so.1"),
         paths.lib_dir.join("libnvidia-ml.so.1"),
     ]
@@ -192,13 +191,13 @@ mod tests {
     }
 
     #[test]
-    fn attach_writes_config_and_three_preload_lines() {
+    fn attach_writes_config_and_two_preload_lines() {
         let paths = temp_paths();
         attach(&paths, &box_info(), false).unwrap();
         let config = fs::read_to_string(&paths.config).unwrap();
         assert!(config.contains("https://olgp.local:8843"));
         let preload = fs::read_to_string(&paths.preload).unwrap();
-        assert_eq!(preload.lines().count(), 3);
+        assert_eq!(preload.lines().count(), 2);
         assert!(preload.contains("libcuda.so.1"));
     }
 
@@ -231,7 +230,7 @@ mod tests {
         attach(&paths, &box_info(), false).unwrap();
         attach(&paths, &box_info(), false).unwrap();
         let preload = fs::read_to_string(&paths.preload).unwrap();
-        assert_eq!(preload.lines().count(), 3);
+        assert_eq!(preload.lines().count(), 2);
     }
 
     #[test]
