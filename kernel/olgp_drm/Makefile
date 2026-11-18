@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 obj-m += olgp_drm.o
+.DEFAULT_GOAL := default
 
 olgp_drm-objs := olgp_drv.o olgp_ioctl.o olgp_gem.o
 
