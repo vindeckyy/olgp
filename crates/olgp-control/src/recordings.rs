@@ -178,6 +178,52 @@ impl RecordingStore {
         Err("asr_unavailable".to_owned())
     }
 
+    /// Finish a recording with transcript segments from an external ASR backend.
+    ///
+    /// # Errors
+    /// Returns `unknown recording` for a missing id or a persistence error.
+    pub fn finish_with(
+        &mut self,
+        id: &str,
+        segments: Vec<String>,
+    ) -> Result<Recording, String> {
+        let index = self
+            .recordings
+            .iter()
+            .position(|recording| recording.id == id)
+            .ok_or_else(|| format!("unknown recording {id}"))?;
+        self.recordings[index].state = "finished".to_owned();
+        self.recordings[index].segments = segments;
+        self.persist()?;
+        Ok(self.recordings[index].clone())
+    }
+
+    /// Reprocess retained audio with externally produced segments.
+    ///
+    /// # Errors
+    /// Returns `audio_not_retained` or `unknown recording` when inapplicable.
+    pub fn reprocess_with(
+        &mut self,
+        id: &str,
+        segments: Vec<String>,
+    ) -> Result<Recording, String> {
+        let index = self
+            .recordings
+            .iter()
+            .position(|recording| recording.id == id)
+            .ok_or_else(|| format!("unknown recording {id}"))?;
+        if !self.recordings[index].retain_audio {
+            return Err("audio_not_retained".to_owned());
+        }
+        self.finish_with(id, segments)
+    }
+
+    /// Root directory containing recording metadata and PCM chunks.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn chunk_dir(&self, id: &str) -> Result<PathBuf, String> {
         let suffix = id
             .strip_prefix("rec-")
@@ -308,6 +354,30 @@ mod tests {
         let saved = store.get(&retained.id).unwrap();
         assert_eq!(saved.state, "transcription_unavailable");
         assert!(saved.segments.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transcript_segments_can_be_stored_and_reprocessed() {
+        let root = temp_root();
+        let mut store = RecordingStore::load(&root).unwrap();
+        let recording = store.create(true).unwrap();
+        assert_eq!(store.root(), root.as_path());
+        let finished = store
+            .finish_with(&recording.id, vec!["hello".into(), "world".into()])
+            .unwrap();
+        assert_eq!(finished.state, "finished");
+        assert_eq!(finished.segments, vec!["hello", "world"]);
+        let reprocessed = store
+            .reprocess_with(&recording.id, vec!["again".into()])
+            .unwrap();
+        assert_eq!(reprocessed.segments, vec!["again"]);
+        let discarded = store.create(false).unwrap();
+        assert_eq!(
+            store.reprocess_with(&discarded.id, vec!["no".into()]).unwrap_err(),
+            "audio_not_retained"
+        );
+        assert!(store.finish_with("missing", Vec::new()).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 }

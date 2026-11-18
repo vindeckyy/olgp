@@ -3,7 +3,7 @@
 //! This module keeps first-party device state local to the box. Preview
 //! operations report honest unavailability instead of synthesizing results.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -358,12 +358,22 @@ impl ProductState {
             _ => {
                 if let Some(id) = bounded(path, "/v1/audio/recordings/", ":finish") {
                     if method == "POST" {
-                        return Some(mutation(store.finish(id)));
+                        let root = store.root().to_path_buf();
+                        return Some(match external_asr(&root, id) {
+                            Ok(segments) => mutation(store.finish_with(id, segments)),
+                            Err(message) if message == "asr_unavailable" => mutation(store.finish(id)),
+                            Err(message) => err("asr_failed", &message, "422 Unprocessable Entity", true),
+                        });
                     }
                 }
                 if let Some(id) = bounded(path, "/v1/audio/recordings/", ":reprocess") {
                     if method == "POST" {
-                        return Some(mutation(store.reprocess(id)));
+                        let root = store.root().to_path_buf();
+                        return Some(match external_asr(&root, id) {
+                            Ok(segments) => mutation(store.reprocess_with(id, segments)),
+                            Err(message) if message == "asr_unavailable" => mutation(store.reprocess(id)),
+                            Err(message) => err("asr_failed", &message, "422 Unprocessable Entity", true),
+                        });
                     }
                 }
                 if let Some(id) = bounded(path, "/v1/audio/recordings/", "/audio") {
@@ -469,6 +479,44 @@ fn now_nanos() -> u128 {
         .unwrap_or_default()
         .as_nanos()
 }
+
+fn external_asr(root: &Path, id: &str) -> Result<Vec<String>, String> {
+    let command = std::env::var("OLGP_ASR_CMD").map_err(|_| "asr_unavailable".to_owned())?;
+    external_asr_with(&command, root, id)
+}
+
+fn external_asr_with(command: &str, root: &Path, id: &str) -> Result<Vec<String>, String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{command} \"$1\" \"$2\""))
+        .arg("olgp-asr")
+        .arg(root)
+        .arg(id)
+        .output()
+        .map_err(|e| format!("asr_spawn: {e}"))?;
+    if !output.status.success() {
+        return Err("asr_failed".to_owned());
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(map)) => match map.get("segments") {
+            Some(Value::Array(items)) => Ok(items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()),
+            _ => Err("asr_bad_output".to_owned()),
+        },
+        Ok(Value::Array(items)) => Ok(items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()),
+        _ if text.is_empty() => Err("asr_empty".to_owned()),
+        _ => Ok(vec![text]),
+    }
+}
+
 
 fn memory_authorized(head: &str) -> bool {
     head.lines().any(|line| {
@@ -681,5 +729,28 @@ mod tests {
         assert!(number(None, "x").is_none());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn external_asr_parses_transcript_segments() {
+        let root = Path::new("/tmp");
+        let segments = external_asr_with(
+            r#"printf '{"segments":["hello","world"]}'"#,
+            root,
+            "rec-1",
+        )
+        .unwrap();
+        assert_eq!(segments, vec!["hello", "world"]);
+        assert_eq!(
+            external_asr_with(r#"printf '["one","two"]'"#, root, "rec-1").unwrap(),
+            vec!["one", "two"]
+        );
+        assert_eq!(
+            external_asr_with("printf 'plain text'", root, "rec-1").unwrap(),
+            vec!["plain text"]
+        );
+        assert!(external_asr_with("printf ''", root, "rec-1").is_err());
+        assert!(external_asr_with("printf '{}'", root, "rec-1").is_err());
+        assert!(external_asr_with("false", root, "rec-1").is_err());
     }
 }
