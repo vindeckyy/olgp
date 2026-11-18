@@ -44,6 +44,23 @@ fn validate_request(operation: &str, request: &str) -> Result<(), String> {
             return Err("invalid_parameter: frames".into());
         }
     }
+    if operation == "detect" {
+        let confidence = parameters
+            .and_then(|p| p.get("confidence"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.25);
+        if !(0.0..=1.0).contains(&confidence) {
+            return Err("invalid_parameter: confidence".into());
+        }
+        let input_size = integer("inputSize").unwrap_or(640);
+        if !(64..=2048).contains(&input_size) {
+            return Err("invalid_parameter: inputSize".into());
+        }
+        let max_detections = integer("maxDetections").unwrap_or(300);
+        if !(1..=1000).contains(&max_detections) {
+            return Err("invalid_parameter: maxDetections".into());
+        }
+    }
     if let Some(inputs) = value.get("inputs").and_then(Value::as_object) {
         for (key, input) in inputs {
             if key == "image" || key == "source" || key == "target" {
@@ -344,6 +361,10 @@ mod tests {
         assert!(store.create("generate", "{\"parameters\":{\"steps\":101}}").is_err());
         assert!(store.create("reframe", "{\"parameters\":{\"width\":100,\"height\":100}}").is_ok());
         assert!(store.create("reframe", "{\"parameters\":{\"fps\":4}}").is_err());
+        assert!(store.create("detect", "{\"parameters\":{\"confidence\":0.25,\"inputSize\":640,\"maxDetections\":300}}").is_ok());
+        assert!(store.create("detect", "{\"parameters\":{\"confidence\":1.5}}").is_err());
+        assert!(store.create("detect", "{\"parameters\":{\"inputSize\":32}}").is_err());
+        assert!(store.create("detect", "{\"parameters\":{\"maxDetections\":0}}").is_err());
     }
 
     #[test]

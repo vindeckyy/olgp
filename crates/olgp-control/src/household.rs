@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+const TIMER_KINDS: [&str; 3] = ["timer", "alarm", "reminder"];
+
 /// A timer or reminder record.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Timer {
@@ -91,6 +93,9 @@ impl Household {
     /// # Errors
     /// Returns an IO error when the store cannot be persisted.
     pub fn add_timer(&mut self, timer: Timer) -> Result<(), String> {
+        if !TIMER_KINDS.contains(&timer.kind.as_str()) {
+            return Err(format!("invalid_kind: {}", timer.kind));
+        }
         self.store.timers.push(timer);
         self.persist().map_err(|e| e.to_string())
     }
@@ -198,6 +203,23 @@ mod tests {
             device_id: Some("phone-1".into()),
             cancelled: false,
         }
+    }
+
+    #[test]
+    fn timer_kind_is_validated() {
+        let path = temp_path();
+        let _ = fs::remove_file(&path);
+        let mut store = Household::load(&path).unwrap();
+        let mut bad = timer("t1");
+        bad.kind = "unknown".into();
+        assert!(store.add_timer(bad).is_err());
+        for kind in TIMER_KINDS {
+            let mut valid = timer(kind);
+            valid.id = kind.to_owned();
+            store.add_timer(valid).unwrap();
+        }
+        assert_eq!(store.timers().len(), TIMER_KINDS.len());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -258,6 +258,12 @@ impl ProductState {
                         .or_else(|| field(request, "capture_epoch"))
                         .unwrap_or_else(|| current.capture_epoch.clone()),
                 };
+                if !matches!(settings.mode.as_str(), "disabled" | "paused" | "active") {
+                    return Some(err("invalid_mode", "mode must be disabled, paused, or active", "400 Bad Request", false));
+                }
+                if settings.retention_days == 0 || settings.retention_days > 3650 {
+                    return Some(err("invalid_request", "retention_days must be 1..=3650", "400 Bad Request", false));
+                }
                 Some(mutation(store.set_settings(settings).map(|()| json!({"accepted":true}))))
             }
             ("GET", "/v1/audio-memory/episodes") => Some(ok(json!(store.episodes()))),
@@ -338,6 +344,9 @@ impl ProductState {
                     let question = field(request, "query").or_else(|| field(request, "question"))
                         .unwrap_or_default();
                     let top_k = number(request, "topK").unwrap_or(5) as usize;
+                    if !(1..=20).contains(&top_k) {
+                        return Some(err("invalid_request", "topK must be 1..=20", "400 Bad Request", false));
+                    }
                     return Some(mutation(store.query(base_id, &question, top_k)));
                 }
                 _ => {}
@@ -695,6 +704,8 @@ mod tests {
         assert_eq!(status_of(&state.handle("POST", "/v1/phones/phone-1:ring", auth, "{\"durationSec\":61}").unwrap()), "400");
 
         assert_eq!(status_of(&state.handle("PATCH", "/v1/audio-memory/settings", memory_auth, "{}").unwrap()), "200");
+        assert_eq!(status_of(&state.handle("PATCH", "/v1/audio-memory/settings", memory_auth, "{\"mode\":\"bogus\"}").unwrap()), "400");
+        assert_eq!(status_of(&state.handle("PATCH", "/v1/audio-memory/settings", memory_auth, "{\"retention_days\":0}").unwrap()), "400");
         assert_eq!(status_of(&state.handle("POST", "/v1/audio-memory:query", memory_auth, "").unwrap()), "200");
         assert_eq!(status_of(&state.handle("POST", "/v1/audio-memory:forget", memory_auth, "").unwrap()), "200");
 
@@ -705,6 +716,7 @@ mod tests {
         assert_eq!(status_of(&state.handle("POST", "/v1/knowledge-bases/missing:query", auth, "{}").unwrap()), "400");
 
         assert_eq!(status_of(&state.handle("GET", "/v1/audio/recordings/missing", auth, "").unwrap()), "404");
+        assert_eq!(status_of(&state.handle("POST", "/v1/knowledge-bases/missing:query", auth, "{\"query\":\"x\",\"topK\":99}").unwrap()), "400");
         assert_eq!(status_of(&state.handle("DELETE", "/v1/audio/recordings/missing", auth, "").unwrap()), "200");
         assert_eq!(status_of(&state.handle("GET", "/v2/images/jobs/missing", auth, "").unwrap()), "404");
         assert_eq!(status_of(&state.handle("GET", "/v2/images/jobs/missing/result", auth, "").unwrap()), "409");
