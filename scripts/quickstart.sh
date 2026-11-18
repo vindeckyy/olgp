@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 DIR="${OLGP_CONFIG_DIR:-/etc/olgp}"
 STAGE="${OLGP_DRIVER_STAGE_DIR:-staging/driver}"
 
-cargo run -q -p olgp-cli -- setup --dir "$DIR"
+cargo run -q -p olgp-cli --bin olgpctl -- setup --dir "$DIR"
 scripts/build-driver.sh
 cargo build --release -p olgp-cli -p olgp-node
 sudo env OLGP_DRIVER_STAGE_DIR="$STAGE" target/release/olgpctl install-driver

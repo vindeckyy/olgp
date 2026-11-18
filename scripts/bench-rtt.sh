@@ -16,4 +16,4 @@ fi
 sudo tc qdisc replace dev "$INTERFACE" root netem delay 750us
 trap 'sudo tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1 || true' EXIT
 
-cargo run -q -p olgp-cli -- bench --workload dependency-chain --calls 20000
+cargo run -q -p olgp-cli --bin olgpctl -- bench --workload dependency-chain --calls 20000

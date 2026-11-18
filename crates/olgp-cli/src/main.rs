@@ -410,6 +410,12 @@ fn main() -> Result<(), String> {
         "doctor" => {
             let box_id = rest.first().ok_or("usage: olgpctl doctor <box-id>")?;
             let cred = credential(box_id)?;
+            let box_info = discover_box(box_id)?;
+            let api = TcpStream::connect((box_info.address, box_info.api_port)).is_ok();
+            let rpc = TcpStream::connect((box_info.address, box_info.rpc_port)).is_ok();
+            if !api || !rpc {
+                return Err(format!("doctor: api_ok={api} rpc_ok={rpc}"));
+            }
             println!("pairing ok, rpc ok, api ok, token {}", &cred.token[..8]);
             Ok(())
         }
