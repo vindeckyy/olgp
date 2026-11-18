@@ -33,6 +33,7 @@ openssl x509 -in "$WORK/tls/cert.pem" -pubkey -noout \
 python3 tests/e2e/fake_engine.py 18080 >"$WORK/engine.log" 2>&1 &
 engine=$!
 OLGP_CONFIG="$WORK/node.toml" OLGP_SPKI_PATH="$WORK/spki.sha256" \
+OLGP_PAIRING_CODE_PATH="$WORK/pairing.code" \
 OLGP_CERT_PATH="$WORK/tls/cert.pem" OLGP_KEY_PATH="$WORK/tls/key.pem" \
 cargo run -q -p olgp-node >"$WORK/node.log" 2>&1 &
 node=$!

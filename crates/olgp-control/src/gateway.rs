@@ -2,11 +2,12 @@
 
 use std::fs::File;
 use std::io::BufReader;
+use std::os::unix::fs::PermissionsExt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lumen_crypto::pairing::{ChannelBinding, DeviceIdentity};
+use lumen_crypto::pairing::{ChannelBinding, DeviceIdentity, PairingCode};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,6 +26,7 @@ struct GatewayState {
     pairing: Mutex<Option<HostPairing>>,
     pairing_window: Mutex<Option<std::time::Instant>>,
     pairing_attempts: Mutex<u32>,
+    pairing_code: PairingCode,
     engine_port: u16,
 }
 fn response(status: &str, body: &str) -> Vec<u8> {
@@ -278,14 +280,12 @@ fn pairing_request(state: &GatewayState, body: &str) -> Vec<u8> {
                 client_static: key,
                 host_static: state.identity.public_bytes(),
             };
-            let mut pairing = HostPairing::new(state.identity.clone(), binding);
+            let mut pairing = HostPairing::with_code(
+                state.identity.clone(),
+                binding,
+                state.pairing_code,
+            );
             let host_pake = pairing.begin();
-            let code_path = std::env::var("OLGP_PAIRING_CODE_PATH")
-                .unwrap_or_else(|_| "/var/lib/olgp/pairing.code".into());
-            if let Some(parent) = std::path::Path::new(&code_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(&code_path, format!("{}\n", pairing.code()));
             let reply = json!({
                 "host_key": hex(&state.identity.public_bytes()),
                 "nonce": hex(pairing.nonce()),
@@ -383,12 +383,25 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         .await
         .map_err(|e| format!("rpc bind: {e}"))?;
     let acceptor = tls_acceptor(&config)?;
+    let pairing_code = PairingCode::random();
+    let code_path = std::path::PathBuf::from(
+        std::env::var("OLGP_PAIRING_CODE_PATH")
+            .unwrap_or_else(|_| "/var/lib/olgp/pairing.code".into()),
+    );
+    if let Some(parent) = code_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("pairing code dir: {e}"))?;
+    }
+    std::fs::write(&code_path, format!("{pairing_code}\n"))
+        .map_err(|e| format!("pairing code write: {e}"))?;
+    std::fs::set_permissions(&code_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("pairing code mode: {e}"))?;
     let state = Arc::new(GatewayState {
         info,
         identity: DeviceIdentity::generate().map_err(|e| e.to_string())?,
         pairing: Mutex::new(None),
         pairing_window: Mutex::new(Some(std::time::Instant::now() + Duration::from_secs(900))),
         pairing_attempts: Mutex::new(0),
+        pairing_code,
         engine_port: config.engine_port,
     });
     let upstream = SocketAddr::from(([127, 0, 0, 1], 14833));
@@ -441,6 +454,7 @@ mod tests {
             pairing: Mutex::new(None),
             pairing_window: Mutex::new(Some(std::time::Instant::now() + Duration::from_secs(900))),
             pairing_attempts: Mutex::new(0),
+            pairing_code: PairingCode::new(123456),
             engine_port: 18080,
         }
     }

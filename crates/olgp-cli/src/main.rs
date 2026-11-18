@@ -338,9 +338,19 @@ fn command_setup(args: &[String]) -> Result<(), String> {
     println!("box_id: {box_id}");
     Ok(())
 }
+
+fn command_pairing_show() -> Result<(), String> {
+    let path = PathBuf::from(
+        env::var("OLGP_PAIRING_CODE_PATH")
+            .unwrap_or_else(|_| "/var/lib/olgp/pairing.code".into()),
+    );
+    let code = fs::read_to_string(path).map_err(|e| format!("pairing code: {e}"))?;
+    print!("{code}");
+    Ok(())
+}
 fn print_help() {
     println!("olgpctl <command> [args]");
-    println!("commands: setup, discover, pair, doctor, attach, detach, install-driver, venus, status, models, cache, bench");
+    println!("commands: setup, discover, pairing show, pair, doctor, attach, detach, install-driver, venus, status, models, cache, bench");
 }
 
 fn main() -> Result<(), String> {
@@ -407,6 +417,7 @@ fn main() -> Result<(), String> {
             }
         }
         "pair" => command_pair(rest),
+        "pairing" if rest.first().map(String::as_str) == Some("show") => command_pairing_show(),
         "doctor" => {
             let box_id = rest.first().ok_or("usage: olgpctl doctor <box-id>")?;
             let cred = credential(box_id)?;

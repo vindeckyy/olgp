@@ -83,9 +83,19 @@ impl HostPairing {
     /// Start a fresh attempt for this connection.
     #[must_use]
     pub fn new(identity: DeviceIdentity, binding: ChannelBinding) -> Self {
+        Self::with_code(identity, binding, PairingCode::random())
+    }
+
+    /// Start an attempt using a code already displayed by the box.
+    #[must_use]
+    pub fn with_code(
+        identity: DeviceIdentity,
+        binding: ChannelBinding,
+        code: PairingCode,
+    ) -> Self {
         Self {
             identity,
-            code: PairingCode::random(),
+            code,
             nonce: random_bytes::<32>(),
             binding,
             pake: None,
