@@ -495,4 +495,54 @@ mod tests {
         assert!(error.contains("turn_limit"));
         let _ = server.await;
     }
+
+    #[tokio::test]
+    async fn cancel_and_reset_emit_end_events() {
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_tungstenite::client_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            serve(socket, VoiceMode::Chat).await.unwrap();
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut client, _) = client_async("ws://127.0.0.1/realtime?mode=chat", stream)
+            .await
+            .unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("ready"));
+        client.send(Message::Text(json!({"type":"cancel"}).to_string().into())).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
+        client.send(Message::Text(json!({"type":"reset"}).to_string().into())).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
+        client.close(None).await.unwrap();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn speaker_audio_session_accepts_pcm_and_closes() {
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_tungstenite::client_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            serve_speaker_audio(socket).await.unwrap();
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut client, _) = client_async("ws://127.0.0.1/speaker/audio:stream", stream)
+            .await
+            .unwrap();
+        let ready = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(ready.contains("\"type\":\"ready\""));
+        client.send(Message::Binary(vec![0x01, 0, 0, 0].into())).await.unwrap();
+        client
+            .send(Message::Text(json!({"type":"unknown"}).to_string().into()))
+            .await
+            .unwrap();
+        client.close(None).await.unwrap();
+        let _ = server.await;
+    }
 }

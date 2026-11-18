@@ -46,6 +46,7 @@ keep = {
     "crates/olgp-control/src/netlink.rs",
 }
 found = covered = 0
+per_file = {}
 current = None
 line_count = None
 for raw in pathlib.Path("target/lcov-control.info").read_text().splitlines():
@@ -56,13 +57,17 @@ for raw in pathlib.Path("target/lcov-control.info").read_text().splitlines():
         line_count = int(raw[3:])
     elif raw.startswith("LH:") and current and line_count is not None:
         if any(current.endswith(suffix) for suffix in keep):
-            covered += int(raw[3:])
+            hit = int(raw[3:])
+            covered += hit
             found += line_count
+            per_file[current] = (hit, line_count)
         current = None
         line_count = None
 percent = 100.0 * covered / found if found else 0.0
 print(f"rust coverage: {covered}/{found} lines ({percent:.2f}%)")
 if percent < threshold:
+    for path, (hit, total) in sorted(per_file.items()):
+        print(f"  {100.0 * hit / total:6.2f}% {hit}/{total} {path}")
     raise SystemExit(f"rust coverage {percent:.2f}% is below {threshold:.0f}%")
 PY
 

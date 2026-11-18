@@ -48,7 +48,7 @@ scripts/run-all.sh
 ```
 
 On Ubuntu/Debian, the C++ semantic tests need `libnghttp2-dev` and
-`libssl-dev`; the coverage gate needs `cargo-llvm-cov`, the Rust
+the coverage gate needs `cargo-llvm-cov` 0.9.1, the Rust
 `llvm-tools-preview` component, and Python `blake3` and `coverage`.
 
 
