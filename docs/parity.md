@@ -47,6 +47,7 @@ the same bounded first-pair or invitation window and returns a scoped
 ## Verified live
 
 - `scripts/check-contract.sh`: `contract ok: 65 routes, 9 TXT keys`.
+- GitHub Actions `ci` green on `5f1e375` (run `44237825089`): tests, C++ semantic/dispatch, contract/patch/kernel checks, and 95% coverage gate.
 - `scripts/run-all.sh`: deterministic checks pass; hardware RTT and CUDA remain explicit skips.
 - Linux GPU box: mDNS discovery, SPAKE2 pairing, credential mode `0600`,
   `doctor`, capabilities with `vram_mib=4096`, TLS listener, and five wrong-code
