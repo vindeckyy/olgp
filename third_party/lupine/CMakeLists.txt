@@ -321,6 +321,7 @@ add_library(lupine_rpc_core STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/device_stdout.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/client_bundle.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/olgp_semantic.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/olgp_dispatch.cpp
 )
 lupine_internal_target(lupine_rpc_core)
 target_include_directories(lupine_rpc_core
@@ -899,6 +900,19 @@ if(BUILD_TESTING AND OLGP_PATCHES)
         target_compile_definitions(olgp_semantic_test PRIVATE OLGP_SEMANTIC_OPENSSL)
     endif()
     add_test(NAME olgp_semantic_test COMMAND olgp_semantic_test)
+endif()
+
+if(BUILD_TESTING AND OLGP_PATCHES)
+    add_executable(olgp_dispatch_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/olgp_dispatch_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/olgp_dispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/olgp_semantic.cpp)
+    target_include_directories(olgp_dispatch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(OpenSSL_FOUND)
+        target_link_libraries(olgp_dispatch_test PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(olgp_dispatch_test PRIVATE OLGP_SEMANTIC_OPENSSL)
+    endif()
+    add_test(NAME olgp_dispatch_test COMMAND olgp_dispatch_test)
 endif()
 
 # Uses Unix socketpair().

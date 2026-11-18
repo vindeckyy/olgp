@@ -19,6 +19,8 @@ required = {
         "add_compile_definitions(OLGP_PATCHES=1)",
         "olgp_semantic.cpp",
         "olgp_semantic_test",
+        "olgp_dispatch.cpp",
+        "olgp_dispatch_test",
     ],
     "third_party/lupine/rpc.h": [
         "OLGP_OP_BASE = 0x8000",
@@ -30,6 +32,17 @@ required = {
         "class BatchRecognizer",
         "class TraceRecorder",
         "class HandleTable",
+    ],
+    "third_party/lupine/olgp_dispatch.h": [
+        "encode_batch",
+        "decode_batch",
+        "class TraceSessions",
+        "class ContentCache",
+    ],
+    "third_party/lupine/olgp_dispatch.cpp": [
+        "olgp_dispatch_cache_query",
+        "olgp_dispatch_cache_put",
+        "olgp_dispatch_batch_wire_size",
     ],
     "third_party/lupine/UPSTREAM_PIN": [
         "74c5bbd0089b9ceb659699fb45fde866252682fb",
