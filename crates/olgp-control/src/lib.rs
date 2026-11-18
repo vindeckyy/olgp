@@ -9,6 +9,7 @@ pub mod household;
 pub mod pairing;
 pub mod sched;
 pub mod registry;
+pub mod memory;
 pub mod telemetry;
 pub mod voice;
 pub mod venus;

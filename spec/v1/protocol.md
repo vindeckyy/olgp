@@ -60,11 +60,11 @@ Host pin file: `$HOME/.config/olgp/boxes/<boxid>.json`, mode 0600, fields
 
 Trusted client store: `/var/lib/olgp/trusted_clients.json`, mode 0600.
 
-First pairing window: 15 minutes after `olgp-node` starts. `olgpctl pairing open`
-opens a 5-minute invitation. A client with no host pin meeting a host that
-already trusts it is refused; the host operator must remove the client from the
-trust store to pair again. There is no attempt rate limit beyond one guess per
-connection.
+First pairing window: 15 minutes after `olgp-node` starts. A client with no host
+pin meeting a host that already trusts it is refused. The window can be
+reopened for five minutes with `POST /v1/pairing:open` by an authenticated
+writer and closed with `POST /v1/pairing:close`. A pairing attempt is refused
+after five failed attempts in one window.
 
 Key separation uses HKDF-SHA256 with distinct info strings:
 `olgp-control-h2c-v1`, `olgp-control-c2h-v1`, `olgp-api-h2c-v1`, and

@@ -2,6 +2,8 @@ import pathlib
 import sys
 import tempfile
 import unittest
+import os
+from unittest import mock
 
 import blake3
 
@@ -17,9 +19,10 @@ class SupervisorTest(unittest.TestCase):
             ROOT / "engine/olgp-engine/profiles.toml"
         )
 
-    def test_profiles_have_three_aliases(self) -> None:
+    def test_profiles_have_four_aliases(self) -> None:
+        self.assertEqual(len(set(supervisor.ALIASES)), 4)
         self.assertEqual(set(supervisor.ALIASES), {
-            "qwen25-0p5", "qwen25-1p5", "qwen15-moe-a2p7"
+            "qwen25-0p5", "qwen25-1p5", "qwen15-moe-a2p7", "turbo"
         })
 
     def test_dense_command_binds_loopback_only(self) -> None:
@@ -61,6 +64,20 @@ class SupervisorTest(unittest.TestCase):
                     {"moe": dict(self.profiles["moe"], filename_glob="missing-*.gguf")},
                 )
 
+
+    def test_turbo_profile_requires_environment_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            model = pathlib.Path(directory) / "turbo.gguf"
+            model.write_bytes(b"x")
+            with mock.patch.dict(os.environ, {"OLGP_TURBO_GGUF": str(model)}):
+                resolved = supervisor.resolve_model("turbo", pathlib.Path(directory), self.profiles)
+            self.assertEqual(resolved, model)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError):
+                supervisor.resolve_model("turbo", pathlib.Path("/tmp"), self.profiles)
+        with mock.patch.dict(os.environ, {"OLGP_TURBO_GGUF": "/missing/turbo.gguf"}):
+            with self.assertRaises(FileNotFoundError):
+                supervisor.resolve_model("turbo", pathlib.Path("/tmp"), self.profiles)
 
     def test_missing_profile_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

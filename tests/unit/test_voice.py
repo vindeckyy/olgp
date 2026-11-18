@@ -28,6 +28,11 @@ class VoiceTest(unittest.TestCase):
         )
         self.assertEqual(session.final_text, "water")
 
+    def test_session_waits_on_weak_answer(self) -> None:
+        session = voice.VoiceSession("s4", 16000)
+        session.answer("maybe")
+        self.assertFalse(session.decide(voice.GateInput(0, 4, 0, 90, 50)))
+        self.assertIsNone(session.final_text)
     def test_session_cancel_clears_tentative(self) -> None:
         session = voice.VoiceSession("s2", 16000)
         session.answer("maybe")

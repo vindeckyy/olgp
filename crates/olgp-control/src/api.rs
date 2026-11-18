@@ -9,8 +9,8 @@ pub struct Route {
     pub path: &'static str,
 }
 
-/// All 19 v1 routes.
-pub const ROUTES: [Route; 19] = [
+/// All 28 v1 routes.
+pub const ROUTES: [Route; 28] = [
     Route { method: "GET", path: "/v1/health/live" },
     Route { method: "GET", path: "/v1/capabilities" },
     Route { method: "GET", path: "/v1/pairing/status" },
@@ -30,6 +30,15 @@ pub const ROUTES: [Route; 19] = [
     Route { method: "POST", path: "/v1/timers" },
     Route { method: "GET", path: "/v1/memos" },
     Route { method: "POST", path: "/v1/memos" },
+    Route { method: "GET", path: "/v1/audio-memory/status" },
+    Route { method: "GET", path: "/v1/audio-memory/settings" },
+    Route { method: "PATCH", path: "/v1/audio-memory/settings" },
+    Route { method: "GET", path: "/v1/audio-memory/episodes" },
+    Route { method: "GET", path: "/v1/audio-memory/notes" },
+    Route { method: "POST", path: "/v1/audio-memory/notes" },
+    Route { method: "POST", path: "/v1/audio-memory:query" },
+    Route { method: "POST", path: "/v1/audio-memory:forget" },
+    Route { method: "POST", path: "/v1/audio-memory:clear" },
 ];
 
 /// Return the route registry.
@@ -43,8 +52,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_count_is_nineteen() {
-        assert_eq!(routes().len(), 19);
+    fn route_count_is_twenty_eight() {
+        assert_eq!(routes().len(), 28);
     }
 
     #[test]

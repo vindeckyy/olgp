@@ -21,3 +21,11 @@ engine = "inferssd"
 context = 4096
 batch = 256
 min_vram_mib = 512
+
+[turbo]
+repo_id = "environment:OLGP_TURBO_GGUF"
+filename_glob = ""
+engine = "inferssd"
+context = 8192
+batch = 256
+min_vram_mib = 512

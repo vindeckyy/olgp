@@ -6,6 +6,7 @@ surface.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import shlex
 import tomllib
@@ -17,6 +18,7 @@ ALIASES = {
     "qwen25-0p5": "small",
     "qwen25-1p5": "medium",
     "qwen15-moe-a2p7": "moe",
+    "turbo": "turbo",
 }
 
 
@@ -26,8 +28,21 @@ def load_profiles(path: pathlib.Path) -> dict[str, dict[str, Any]]:
         return tomllib.load(handle)
 
 
-def resolve_model(alias: str, model_dir: pathlib.Path, profiles: dict[str, dict[str, Any]]) -> pathlib.Path:
+def resolve_model(
+    alias: str,
+    model_dir: pathlib.Path,
+    profiles: dict[str, dict[str, Any]],
+) -> pathlib.Path:
     """Resolve a public alias to a local GGUF file."""
+    if alias == "turbo":
+        configured = os.environ.get("OLGP_TURBO_GGUF")
+        if not configured:
+            raise ValueError("OLGP_TURBO_GGUF is required for the turbo profile")
+        path = pathlib.Path(configured)
+        if not path.is_file():
+            raise FileNotFoundError(f"turbo GGUF not found: {path}")
+        return path
+
     profile_name = ALIASES.get(alias)
     if profile_name is None:
         raise ValueError(f"unknown model alias: {alias}")
@@ -62,11 +77,7 @@ def build_command(
             "--host", "127.0.0.1",
         ]
     if profile["engine"] == "inferssd":
-        return [
-            "inferssd", "serve",
-            "-m", str(model_path),
-            "--port", str(port),
-        ]
+        return ["inferssd", "serve", "-m", str(model_path), "--port", str(port)]
     raise ValueError(f"unsupported engine: {profile['engine']}")
 
 
