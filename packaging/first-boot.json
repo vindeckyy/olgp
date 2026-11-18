@@ -12,8 +12,6 @@
     "tls_cert": "/etc/olgp/tls/cert.pem",
     "tls_key": "/etc/olgp/tls/key.pem",
     "spki": "/etc/olgp/spki.sha256",
-    "household": "/var/lib/olgp/household.json",
-    "audio_memory": "/var/lib/olgp/audio-memory.json",
     "pairing_code": "/var/lib/olgp/pairing.code"
   },
   "pairing": {

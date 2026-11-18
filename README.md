@@ -87,8 +87,6 @@ pairing routes, and Device-Token-protected OpenAI/Ollama-compatible routes on
 port `8787`. CUDA/NVML RPC uses TLS on port `8843` and is reverse-proxied to the
 local GPU server.
 
-Device-Token-protected household state is available at `GET/POST /v1/timers`
-and `GET/POST /v1/memos`, backed by `/var/lib/olgp/household.json` by default.
 
 Spec: `spec/v1/protocol.md`. License: Apache-2.0. Third-party inventory:
 `THIRD_PARTY.md`.

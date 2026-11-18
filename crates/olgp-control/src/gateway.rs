@@ -18,8 +18,6 @@ use crate::config::Config;
 use tokio::io::copy_bidirectional;
 use crate::discovery::BoxInfo;
 use crate::pairing::HostPairing;
-use crate::household::{Household, Memo, Timer};
-use crate::memory::{AudioMemory, Settings};
 
 struct GatewayState {
     info: BoxInfo,
@@ -27,8 +25,6 @@ struct GatewayState {
     pairing: Mutex<Option<HostPairing>>,
     pairing_window: Mutex<Option<std::time::Instant>>,
     pairing_attempts: Mutex<u32>,
-    household: Mutex<Household>,
-    memory: Mutex<AudioMemory>,
     engine_port: u16,
 }
 fn response(status: &str, body: &str) -> Vec<u8> {
@@ -183,17 +179,32 @@ async fn handle_request(
             .to_string(),
         ),
         ("GET", "/metrics") => text_response("200 OK", &crate::telemetry::render()),
-        ("GET", "/v1/pairing/status") => response(
-            "200 OK",
-            &json!({"box_id": state.info.box_id, "window_open": true, "paired": false}).to_string(),
-        ),
+        ("GET", "/v1/pairing/status") => {
+            let window = state.pairing_window.lock().unwrap();
+            let open = window.map_or(false, |deadline| std::time::Instant::now() < deadline);
+            let attempts = *state.pairing_attempts.lock().unwrap();
+            response(
+                "200 OK",
+                &json!({
+                    "box_id": state.info.box_id,
+                    "window_open": open,
+                    "attempts": attempts,
+                    "paired": false,
+                })
+                .to_string(),
+            )
+        }
         ("POST", "/v1/pairing") => pairing_request(state, body),
         (_, _) if !authorized(head) => {
             error("unauthorized", "Device Token required", "401 Unauthorized", false)
         }
         ("POST", "/v1/chat/completions")
         | ("POST", "/v1/responses")
-        | ("POST", "/v1/embeddings") => {
+        | ("POST", "/v1/embeddings")
+        | ("POST", "/v1/audio/transcriptions")
+        | ("POST", "/v1/audio/speech")
+        | ("POST", "/api/chat")
+        | ("POST", "/api/generate") => {
             match proxy_engine(state.engine_port, head, body).await {
                 Some(reply) => reply,
                 None => error(
@@ -213,23 +224,6 @@ async fn handle_request(
                 true,
             ),
         },
-        ("GET", "/v1/timers") | ("POST", "/v1/timers") | ("GET", "/v1/memos") | ("POST", "/v1/memos") => {
-            if authorized(head) {
-                household_request(method, path, body, state)
-            } else {
-                error("unauthorized", "Device Token required", "401 Unauthorized", false)
-            }
-        }
-        (method, path)
-            if path.starts_with("/v1/audio-memory")
-                && matches!(method, "GET" | "POST" | "PATCH") =>
-        {
-            if authorized(head) {
-                audio_memory_request(method, path, head, body, state)
-            } else {
-                error("unauthorized", "Device Token required", "401 Unauthorized", false)
-            }
-        }
         ("POST", "/v1/pairing:open") => {
             if !authorized(head) {
                 error("unauthorized", "Device Token required", "401 Unauthorized", false)
@@ -347,142 +341,6 @@ fn pairing_request(state: &GatewayState, body: &str) -> Vec<u8> {
     }
 }
 
-
-fn household_request(method: &str, path: &str, body: &str, state: &GatewayState) -> Vec<u8> {
-    let request: Option<Value> = serde_json::from_str(body).ok();
-    let mut store = state.household.lock().unwrap();
-    match (method, path) {
-        ("GET", "/v1/timers") => response("200 OK", &json!(store.timers()).to_string()),
-        ("POST", "/v1/timers") => {
-            let Some(request) = request else {
-                return error("invalid_request", "bad JSON", "400 Bad Request", false);
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let timer = Timer {
-                id: format!("t{now}"),
-                kind: request.get("kind").and_then(Value::as_str).unwrap_or("timer").to_owned(),
-                due_at_ms: request.get("dueAtMs").and_then(Value::as_u64).unwrap_or(0),
-                title: request.get("title").and_then(Value::as_str).unwrap_or("").to_owned(),
-                cancelled: false,
-            };
-            match store.add_timer(timer.clone()) {
-                Ok(()) => response("200 OK", &json!(timer).to_string()),
-                Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
-            }
-        }
-        ("GET", "/v1/memos") => response("200 OK", &json!(store.memos()).to_string()),
-        ("POST", "/v1/memos") => {
-            let Some(request) = request else {
-                return error("invalid_request", "bad JSON", "400 Bad Request", false);
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let memo = Memo {
-                id: format!("m{now}"),
-                title: request.get("title").and_then(Value::as_str).unwrap_or("").to_owned(),
-                dismissed: false,
-            };
-            match store.add_memo(memo.clone()) {
-                Ok(()) => response("200 OK", &json!(memo).to_string()),
-                Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
-            }
-        }
-        _ => error("invalid_request", "unknown route", "404 Not Found", false),
-    }
-}
-
-fn memory_authorized(head: &str) -> bool {
-    head.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        lower.starts_with("x-olgp-memory-token:") && line.len() > "x-olgp-memory-token:".len()
-            || lower.starts_with("x-wici-memory-token:") && line.len() > "x-wici-memory-token:".len()
-    })
-}
-
-fn audio_memory_request(method: &str, path: &str, head: &str, body: &str, state: &GatewayState) -> Vec<u8> {
-    if !memory_authorized(head) {
-        return error("unauthorized", "Memory Token required", "401 Unauthorized", false);
-    }
-    let request: Option<Value> = serde_json::from_str(body).ok();
-    let mut store = state.memory.lock().unwrap();
-    match (method, path) {
-        ("GET", "/v1/audio-memory/status") => response(
-            "200 OK",
-            &json!({
-                "mode": store.settings().mode,
-                "retention_days": store.settings().retention_days,
-                "episodes": store.episodes().len(),
-                "notes": store.notes().len(),
-                "ready": true,
-            })
-            .to_string(),
-        ),
-        ("GET", "/v1/audio-memory/settings") => response("200 OK", &json!(store.settings()).to_string()),
-        ("PATCH", "/v1/audio-memory/settings") => {
-            let Some(request) = request else {
-                return error("invalid_request", "bad JSON", "400 Bad Request", false);
-            };
-            let settings = Settings {
-                mode: request.get("mode").and_then(Value::as_str).unwrap_or("disabled").to_owned(),
-                retention_days: request
-                    .get("retention_days")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(30)
-                    .min(3650) as u32,
-            };
-            match store.set_settings(settings.clone()) {
-                Ok(()) => response("200 OK", &json!(settings).to_string()),
-                Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
-            }
-        }
-        ("GET", "/v1/audio-memory/episodes") => response("200 OK", &json!(store.episodes()).to_string()),
-        ("GET", "/v1/audio-memory/notes") => response("200 OK", &json!(store.notes()).to_string()),
-        ("POST", "/v1/audio-memory/notes") => {
-            let Some(request) = request else {
-                return error("invalid_request", "bad JSON", "400 Bad Request", false);
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            match store.add_note(
-                format!("n{now}"),
-                request.get("text").and_then(Value::as_str).unwrap_or("").to_owned(),
-                request.get("kind").and_then(Value::as_str).unwrap_or("fact").to_owned(),
-            ) {
-                Ok(()) => response("200 OK", "{\"ok\":true}\n"),
-                Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
-            }
-        }
-        ("POST", "/v1/audio-memory:query") => {
-            let needle = request
-                .as_ref()
-                .and_then(|value| value.get("question").and_then(Value::as_str))
-                .unwrap_or("");
-            response("200 OK", &json!(store.query(needle)).to_string())
-        }
-        ("POST", "/v1/audio-memory:forget") => {
-            let id = request
-                .as_ref()
-                .and_then(|value| value.get("id").and_then(Value::as_str))
-                .unwrap_or("");
-            match store.forget(id) {
-                Ok(removed) => response("200 OK", &json!({"removed": removed}).to_string()),
-                Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
-            }
-        }
-        ("POST", "/v1/audio-memory:clear") => match store.clear() {
-            Ok(()) => response("200 OK", "{\"removed\":true}\n"),
-            Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
-        },
-        _ => error("invalid_request", "unknown route", "404 Not Found", false),
-    }
-}
 fn tls_acceptor(config: &Config) -> Result<TlsAcceptor, String> {
     let mut cert_reader = BufReader::new(
         File::open(config.cert_path()).map_err(|e| format!("cert read: {e}"))?,
@@ -525,24 +383,12 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         .await
         .map_err(|e| format!("rpc bind: {e}"))?;
     let acceptor = tls_acceptor(&config)?;
-    let household_path = std::path::PathBuf::from(
-        std::env::var("OLGP_HOUSEHOLD_PATH")
-            .unwrap_or_else(|_| "/var/lib/olgp/household.json".into()),
-    );
-    let household = Household::load(&household_path)?;
-    let memory_path = std::path::PathBuf::from(
-        std::env::var("OLGP_MEMORY_PATH")
-            .unwrap_or_else(|_| "/var/lib/olgp/audio-memory.json".into()),
-    );
-    let memory = AudioMemory::load(&memory_path)?;
     let state = Arc::new(GatewayState {
         info,
         identity: DeviceIdentity::generate().map_err(|e| e.to_string())?,
         pairing: Mutex::new(None),
         pairing_window: Mutex::new(Some(std::time::Instant::now() + Duration::from_secs(900))),
         pairing_attempts: Mutex::new(0),
-        household: Mutex::new(household),
-        memory: Mutex::new(memory),
         engine_port: config.engine_port,
     });
     let upstream = SocketAddr::from(([127, 0, 0, 1], 14833));
@@ -596,14 +442,6 @@ mod tests {
             pairing_window: Mutex::new(Some(std::time::Instant::now() + Duration::from_secs(900))),
             pairing_attempts: Mutex::new(0),
             engine_port: 18080,
-            household: Mutex::new(
-                Household::load(&std::path::PathBuf::from("/tmp/olgp-gateway-test-household.json"))
-                    .unwrap(),
-            ),
-            memory: Mutex::new(
-                AudioMemory::load(&std::path::PathBuf::from("/tmp/olgp-gateway-test-memory.json"))
-                    .unwrap(),
-            ),
         }
     }
 

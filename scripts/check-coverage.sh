@@ -23,13 +23,11 @@ keep = {
     "crates/olgp-control/src/pairing.rs",
     "crates/olgp-control/src/sched.rs",
     "crates/olgp-control/src/shim.rs",
-    "crates/olgp-control/src/household.rs",
+    "crates/olgp-driver/src/lib.rs",
     "crates/olgp-control/src/telemetry.rs",
     "crates/olgp-control/src/voice.rs",
     "crates/olgp-control/src/venus.rs",
     "crates/olgp-control/src/registry.rs",
-    "crates/olgp-driver/src/lib.rs",
-    "crates/olgp-control/src/memory.rs",
     "crates/olgp-control/src/netlink.rs",
 }
 found = covered = 0
