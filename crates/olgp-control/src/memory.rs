@@ -11,11 +11,15 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     pub mode: String,
     pub retention_days: u32,
+    #[serde(default)]
+    pub revision: u32,
+    #[serde(default)]
+    pub capture_epoch: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { mode: "disabled".into(), retention_days: 30 }
+        Self { mode: "disabled".into(), retention_days: 30, revision: 1, capture_epoch: "2026-01-01T00:00:00Z".into() }
     }
 }
 
@@ -189,7 +193,7 @@ mod tests {
         let path = temp_path();
         let mut memory = AudioMemory::load(&path).unwrap();
         memory
-            .set_settings(Settings { mode: "active".into(), retention_days: 7 })
+            .set_settings(Settings { mode: "active".into(), retention_days: 7, revision: 2, capture_epoch: "2026-01-01T00:00:00Z".into() })
             .unwrap();
         assert!(memory.add_episode("e1".into(), "remember this".into()).unwrap());
         memory.add_note("n1".into(), "remember this".into(), "fact".into()).unwrap();

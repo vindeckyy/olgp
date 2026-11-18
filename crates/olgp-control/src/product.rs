@@ -249,6 +249,10 @@ impl ProductState {
                 let settings = Settings {
                     mode: field(request, "mode").unwrap_or_else(|| "disabled".into()),
                     retention_days: number(request, "retention_days").unwrap_or(30) as u32,
+                    revision: number(request, "revision").unwrap_or(1) as u32,
+                    capture_epoch: field(request, "captureEpoch")
+                        .or_else(|| field(request, "capture_epoch"))
+                        .unwrap_or_else(|| "2026-01-01T00:00:00Z".into()),
                 };
                 Some(mutation(store.set_settings(settings).map(|()| json!({"accepted":true}))))
             }
