@@ -33,6 +33,7 @@ Sources: `https://wici.ai/wici-one`, `https://wici.ai/technology`,
 | Image results | Verified bytes, `result.save()`, content type | `result_bytes` / `ResultBytesAsync` / typed bytes across SDKs | implemented |
 | Search headers | Caller-owned Tavily provider/key headers | All SDKs support optional `X-Wici-Search-*` headers | implemented |
 | Audio capture | `audio.recordings` capture/resume helpers | All SDKs expose start/append/resume aliases over the 7 recording routes | implemented |
+| Realtime SDKs | `realtime.connect(mode)` with control frames and PCM | All five SDKs expose session clients; gateway accepts query-token upgrades | implemented |
 | Hardware SKU | RTX 5060 Ti/5090, Wi-Fi 7, NVMe, enclosure, PSU, cooling | Not reproducible in a protocol repo | structural |
 | Driver platforms | macOS, Windows, Vulkan ICD, D3D, games/CAD/video apps | Not implemented; no misleading stub ICD | structural/gap |
 | Benchmarks | Product tok/s, FPS, export, encode, latency tables | No equivalent hardware claims; benchmark harness reports local results | structural |
@@ -53,6 +54,7 @@ the same bounded first-pair or invitation window and returns a scoped
 - Live engine session: `POST /engine/sessions` returned a ready session and `GET /engine/sessions` listed it.
 - Documented pairing: `expectedDeviceId`/`clientName` issued a scoped token, closed the window, and the token reached product and engine routes (`200/200/201`).
 - C++ `olgp_semantic_test` and `olgp_dispatch_test` pass.
+- Live WebSocket: `/v1/realtime?mode=voice&token=...` returned `101 Switching Protocols`; without a token it returned `401 Unauthorized`.
 - SDK static checks: Swift `swiftc -parse` and TypeScript `Bun.build` pass; C# has no local compiler.
 
 ## Remaining structural non-parity
