@@ -51,6 +51,7 @@ the same bounded first-pair or invitation window and returns a scoped
   `doctor`, capabilities with `vram_mib=4096`, TLS listener, and five wrong-code
   rejections with no credential written.
 - Live engine session: `POST /engine/sessions` returned a ready session and `GET /engine/sessions` listed it.
+- Documented pairing: `expectedDeviceId`/`clientName` issued a scoped token, closed the window, and the token reached product and engine routes (`200/200/201`).
 - C++ `olgp_semantic_test` and `olgp_dispatch_test` pass.
 - SDK static checks: Swift `swiftc -parse` and TypeScript `Bun.build` pass; C# has no local compiler.
 
