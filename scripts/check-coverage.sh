@@ -10,7 +10,8 @@ PYTHON="${PYTHON:-python3}"
 COV_LOG=$(mktemp)
 if ! cargo llvm-cov --workspace --lib --lcov \
   --output-path target/lcov-control.info \
-  --ignore-filename-regex 'third_party|/usr/|rustc/' >"$COV_LOG" 2>&1; then
+  --ignore-filename-regex 'third_party|/usr/|rustc/' \
+  -- --test-threads=1 >"$COV_LOG" 2>&1; then
   cat "$COV_LOG"
   rm -f "$COV_LOG"
   exit 1
