@@ -245,6 +245,19 @@ fn command_cache_gc() -> Result<(), String> {
     Ok(())
 }
 
+fn env_flag(name: &str, default: bool) -> bool {
+    env::var(name).map_or(default, |value| value != "0")
+}
+
+fn workload_digest(workload: &str, calls: u64) -> u64 {
+    let mut digest = 0xcbf29ce484222325u64;
+    for byte in workload.as_bytes().iter().copied().chain(calls.to_le_bytes()) {
+        digest ^= u64::from(byte);
+        digest = digest.wrapping_mul(0x100000001b3);
+    }
+    digest
+}
+
 fn command_bench(args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) != Some("--workload") {
         return Err("usage: olgpctl bench --workload <name>".into());
@@ -258,16 +271,29 @@ fn command_bench(args: &[String]) -> Result<(), String> {
     if workload != "dependency-chain" {
         return Err(format!("unknown workload: {workload}"));
     }
+    let batch = env_flag("OLGP_BATCH", true);
+    let trace = env_flag("OLGP_TRACE", true);
     let mut recognizer = BatchRecognizer::default();
-    for _ in 0..(calls / 2) {
-        let _ = recognizer.note(Op::Launch);
-        let _ = recognizer.note(Op::Launch);
+    if batch {
+        for _ in 0..(calls / 2) {
+            let _ = recognizer.note(Op::Launch);
+            let _ = recognizer.note(Op::Launch);
+        }
     }
+    let hits = recognizer.hits();
+    let blocking = if batch || trace {
+        calls.saturating_sub(hits * 2)
+    } else {
+        calls
+    };
     println!(
-        "workload=dependency-chain calls={} potential_batch_hits={} blocking_calls={}",
+        "workload=dependency-chain calls={} batch={} trace={} potential_batch_hits={} blocking_calls={} digest={:016x}",
         calls,
-        recognizer.hits(),
-        calls.saturating_sub(recognizer.hits() * 2)
+        batch,
+        trace,
+        hits,
+        blocking,
+        workload_digest(workload, calls)
     );
     Ok(())
 }
