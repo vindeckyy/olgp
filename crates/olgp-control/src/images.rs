@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const OPERATIONS: [&str; 5] = ["generate", "edit", "face_swap", "reframe", "detect"];
+const MAX_JOBS: usize = 16;
 
 fn validate_request(operation: &str, request: &str) -> Result<(), String> {
     let value: Value = serde_json::from_str(request).map_err(|_| "invalid_request".to_owned())?;
@@ -128,6 +129,9 @@ impl ImageStore {
             return Err("invalid_request".to_owned());
         }
         validate_request(operation, request)?;
+        if self.state.jobs.len() >= MAX_JOBS {
+            return Err("queue_full".to_owned());
+        }
         let mut next = self.state.clone();
         next.next_id += 1;
         let job = ImageJob {
@@ -352,5 +356,15 @@ mod tests {
         let huge = "x".repeat(20 * 1024 * 1024 + 1);
         assert!(store.create("detect", &format!("{{\"inputs\":{{\"image\":\"{huge}\"}}}}")).is_err());
         assert!(store.create("generate", "not-json").is_err());
+    }
+
+    #[test]
+    fn image_job_queue_is_bounded() {
+        let file = StateFile::new("queue");
+        let mut store = ImageStore::load(&file.path()).unwrap();
+        for _ in 0..MAX_JOBS {
+            store.create("generate", "{}").unwrap();
+        }
+        assert_eq!(store.create("generate", "{}"), Err("queue_full".to_owned()));
     }
 }
