@@ -31,5 +31,6 @@ jobs:
         run: |
           scripts/check-contract.sh
           scripts/check-lupine-patches.sh
+          scripts/check-kernel.sh
       - name: 95% coverage gate
         run: scripts/check-coverage.sh

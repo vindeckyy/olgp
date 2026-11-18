@@ -35,6 +35,10 @@
     "status": "passed",
     "detail": "log:/tmp/olgp-quickstart_script.log"
   },
+  "kernel": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-kernel.log"
+  },
   "rtt": {
     "status": "skipped",
     "detail": "hardware run not requested; set OLGP_E2E=1 on the paired machines"

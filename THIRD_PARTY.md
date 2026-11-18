@@ -10,5 +10,8 @@
 Vendored copies keep their own LICENSE/NOTICE files. Model weights are not
 redistributed and remain under their publishers' licenses.
 
+The kernel module under `kernel/` is licensed `GPL-2.0-only`, separately from
+the Apache-2.0 userspace and specification code.
+
 The WiCi technical report is CC BY-NC-ND 4.0. No text, figures, or code were
 copied from it; only independently implemented architectural behavior is used.

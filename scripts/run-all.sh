@@ -47,6 +47,7 @@ run driver_script bash -n scripts/build-driver.sh
 run semantic_tests scripts/check-semantic.sh
 run venus scripts/check-venus.sh
 run quickstart_script bash -n scripts/quickstart.sh
+run kernel scripts/check-kernel.sh
 
 if [[ "${OLGP_E2E:-0}" == "1" ]]; then
   run rtt scripts/bench-rtt.sh
