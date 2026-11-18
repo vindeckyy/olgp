@@ -183,6 +183,15 @@ async fn engine_reachable(port: u16) -> bool {
     TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).await.is_ok()
 }
 
+
+fn query_param(raw_path: &str, key: &str) -> Option<String> {
+    let query = raw_path.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then(|| value.to_owned())
+    })
+}
+
 async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
     let Some((head, body, first)) = read_request(&mut socket).await else {
         return;
@@ -196,9 +205,18 @@ async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
     } else {
         crate::voice::VoiceMode::Chat
     };
+    let websocket_authorized = || {
+        authorized(&head, &state.trusted.lock().unwrap())
+            || query_param(raw_path, "token")
+                .is_some_and(|token| state.trusted.lock().unwrap().is_valid(&token))
+    };
     if path == "/v1/realtime"
         && head.lines().any(|line| line.to_ascii_lowercase().contains("upgrade: websocket"))
     {
+        if !websocket_authorized() {
+            let _ = socket.write_all(&error("unauthorized", "Device Token required", "401 Unauthorized", false)).await;
+            return;
+        }
         tokio::spawn(crate::voice::serve(socket, mode));
         return;
     }
@@ -206,6 +224,10 @@ async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
         && path.ends_with("/audio:stream")
         && head.lines().any(|line| line.to_ascii_lowercase().contains("upgrade: websocket"))
     {
+        if !websocket_authorized() {
+            let _ = socket.write_all(&error("unauthorized", "Device Token required", "401 Unauthorized", false)).await;
+            return;
+        }
         tokio::spawn(crate::voice::serve_speaker_audio(socket));
         return;
     }
@@ -745,5 +767,14 @@ mod tests {
         let token = issued["token"].as_str().unwrap();
         assert!(state.trusted.lock().unwrap().is_valid(token));
         assert!(state.pairing_window.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn query_param_reads_realtime_token() {
+        assert_eq!(
+            query_param("/v1/realtime?mode=voice&token=abc123", "token").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(query_param("/v1/realtime?mode=voice", "token"), None);
     }
 }

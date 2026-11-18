@@ -77,6 +77,117 @@ export interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
 }
+export type RealtimeMode = "voice" | "chat";
+export type RealtimeEvent = Json & { type: string };
+export type RealtimeConnectOptions = { mode: RealtimeMode };
+
+export class RealtimeSession {
+  private readonly socket: WebSocket;
+  private readonly eventListeners = new Set<(event: RealtimeEvent) => void>();
+  private readonly audioListeners = new Set<(pcm: Uint8Array) => void>();
+  private readonly queue: (string | Uint8Array)[] = [];
+
+  constructor(baseUrl: string, token: string, mode: RealtimeMode) {
+    const url = `${baseUrl.replace(/^http/, "ws")}/v1/realtime?mode=${encodeURIComponent(mode)}&token=${encodeURIComponent(token)}`;
+    this.socket = new WebSocket(url);
+    this.socket.binaryType = "arraybuffer";
+    this.socket.onopen = () => {
+      for (const frame of this.queue.splice(0)) {
+        this.socket.send(frame);
+      }
+    };
+    this.socket.onmessage = (message) => {
+      const data = message.data;
+      if (typeof data === "string") {
+        let event: unknown;
+        try {
+          event = JSON.parse(data);
+        } catch {
+          return;
+        }
+        if (event && typeof event === "object" && "type" in event && typeof event.type === "string") {
+          const parsed = event as RealtimeEvent;
+          for (const listener of [...this.eventListeners]) {
+            listener(parsed);
+          }
+        }
+      } else if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+        const pcm = bytes[0] === 0x01 ? bytes.subarray(1) : bytes;
+        for (const listener of [...this.audioListeners]) {
+          listener(pcm);
+        }
+      }
+    };
+  }
+
+  // String PCM is base64, matching the recordings API.
+  sendPcm(pcm: Uint8Array | string): void {
+    const bytes = typeof pcm === "string" ? RealtimeSession.decodePcm(pcm) : pcm;
+    const frame = new Uint8Array(bytes.length + 1);
+    frame[0] = 0x01;
+    frame.set(bytes, 1);
+    this.send(frame);
+  }
+
+  sendText(text: string): void {
+    this.control("text_input", { text });
+  }
+
+  commit(): void {
+    this.control("commit");
+  }
+
+  cancel(): void {
+    this.control("cancel");
+  }
+
+  reset(): void {
+    this.control("reset");
+  }
+
+  onEvent(listener: (event: RealtimeEvent) => void): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
+  onAudio(listener: (pcm: Uint8Array) => void): () => void {
+    this.audioListeners.add(listener);
+    return () => this.audioListeners.delete(listener);
+  }
+
+  close(): void {
+    this.eventListeners.clear();
+    this.audioListeners.clear();
+    this.queue.length = 0;
+    if (this.socket.readyState === 0 || this.socket.readyState === 1) {
+      this.socket.close();
+    }
+  }
+
+  private control(type: string, extra: Json = {}): void {
+    this.send(JSON.stringify({ type, ...extra }));
+  }
+
+  private send(frame: string | Uint8Array): void {
+    if (this.socket.readyState === 1) {
+      this.socket.send(frame);
+    } else if (this.socket.readyState === 0) {
+      this.queue.push(frame);
+    } else {
+      throw new Error("olgp: realtime session is closed");
+    }
+  }
+
+  private static decodePcm(pcm: string): Uint8Array {
+    const binary = atob(pcm);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+}
 
 export interface OlgpClientOptions {
   baseUrl?: string;
@@ -377,6 +488,10 @@ export class OlgpClient {
   };
   readonly audioRecordings = this.recordings;
   readonly audio = { recordings: this.recordings };
+  readonly realtime = {
+    connect: (options: RealtimeConnectOptions): RealtimeSession =>
+      new RealtimeSession(this.baseUrl, this.token, options.mode),
+  };
 
   async chat(model: string, messages: ChatMessage[]): Promise<string> {
     const body = await this.request<{ choices: { message: { content: string } }[] }>(

@@ -1,10 +1,12 @@
-import io
+import asyncio
 import json
 import os
 import pathlib
 import sys
 import tempfile
 import unittest
+import types
+from typing import Any
 from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -222,6 +224,67 @@ class SdkTest(unittest.TestCase):
         body = json.loads(open_mock.call_args_list[-1].args[0].data)
         self.assertEqual(body["seq"], 2)
         self.assertTrue(hasattr(client.audio, "recordings"))
+
+
+    def test_realtime_client_frames_and_events(self) -> None:
+        class FakeWebSocket:
+            def __init__(self) -> None:
+                self.incoming: asyncio.Queue[Any] = asyncio.Queue()
+                self.sent: list[Any] = []
+
+            async def send(self, frame: Any) -> None:
+                self.sent.append(frame)
+
+            async def recv(self) -> Any:
+                return await self.incoming.get()
+
+            async def close(self) -> None:
+                self.incoming.put_nowait(None)
+
+        ws = FakeWebSocket()
+        urls: list[str] = []
+
+        async def fake_connect(url: str) -> FakeWebSocket:
+            urls.append(url)
+            return ws
+
+        client = olgp.Client("http://box:8787", "tok")
+        events: list[dict[str, Any]] = []
+        audio: list[bytes] = []
+        fake_module = types.SimpleNamespace(connect=fake_connect)
+
+        with mock.patch.dict(sys.modules, {"websockets": fake_module}):
+            async def scenario() -> None:
+                session = await client.realtime.connect("voice")
+                session.on_event(events.append)
+                session.on_audio(audio.append)
+                await session.send_pcm(b"\x01\x02")
+                await session.send_text("hi")
+                await session.commit()
+                await session.cancel()
+                await session.reset()
+                ws.incoming.put_nowait(json.dumps({"type": "ready"}))
+                ws.incoming.put_nowait(b"\x01pcm")
+                await asyncio.sleep(0.02)
+                await session.close()
+                await session.close()
+
+            asyncio.run(scenario())
+
+        self.assertIn("mode=voice", urls[0])
+        self.assertIn("token=tok", urls[0])
+        self.assertIn(b"\x01\x01\x02", ws.sent)
+        self.assertIn(json.dumps({"type": "commit"}), ws.sent)
+        self.assertTrue(any(event.get("type") == "ready" for event in events))
+        self.assertIn(b"pcm", audio)
+
+    def test_realtime_rejects_bad_mode_and_missing_websockets(self) -> None:
+        client = olgp.Client("http://box:8787", "tok")
+        with self.assertRaises(ValueError):
+            asyncio.run(client.realtime.connect("bad"))
+        with mock.patch.dict(sys.modules, {"websockets": None}):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(client.realtime.connect())
 
 if __name__ == "__main__":
     unittest.main()

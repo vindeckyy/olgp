@@ -473,6 +473,11 @@ impl Client {
             },
         })
     }
+
+    /// Open a voice-v1 realtime session on this client's box.
+    pub fn realtime(&self, mode: realtime::Mode) -> Result<realtime::Session, String> {
+        realtime::connect_from_runtime(&self.chat.completions.inner, mode)
+    }
 }
 
 /// Connect using the paired credential for `box`, or environment defaults.
@@ -1142,11 +1147,352 @@ impl RecordingCapture {
     }
 }
 
+/// Voice-v1 WebSocket sessions on `WS /v1/realtime`.
+pub mod realtime {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
+    use tokio::sync::mpsc as tokio_mpsc;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    use super::{READ_TIMEOUT, Runtime, http_base, path_segment, split_base_url, validate_header_value};
+
+    /// Session mode sent as the `mode` query parameter.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum Mode {
+        Voice,
+        Chat,
+    }
+
+    impl Mode {
+        #[must_use]
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Voice => "voice",
+                Self::Chat => "chat",
+            }
+        }
+    }
+
+    /// Audio description from the `ready` event; the box decides the sample rate.
+    #[derive(Clone, Debug, Default, Eq, PartialEq)]
+    pub struct AudioFormat {
+        pub format: Option<String>,
+        pub sample_rate: Option<u32>,
+        pub channels: Option<u32>,
+    }
+
+    /// One typed control event from the box.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct Event {
+        pub kind: String,
+        pub text: Option<String>,
+        /// Complete frame, for protocol fields not exposed above.
+        pub json: Value,
+    }
+
+    impl Event {
+        #[must_use]
+        pub fn is(&self, kind: &str) -> bool {
+            self.kind == kind
+        }
+
+        #[must_use]
+        pub fn audio(&self) -> Option<AudioFormat> {
+            let audio = self.json.get("audio")?;
+            let number = |key: &str| {
+                audio
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+            };
+            Some(AudioFormat {
+                format: audio
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                sample_rate: number("sampleRate"),
+                channels: number("channels"),
+            })
+        }
+    }
+
+    /// Build the WebSocket URL for one realtime session.
+    ///
+    /// # Errors
+    /// Returns a description when the base URL or token is malformed.
+    pub fn realtime_url(base_url: &str, mode: Mode, token: &str) -> Result<String, String> {
+        let (_, _, authority) = split_base_url(base_url)?;
+        validate_header_value("token", token)?;
+        Ok(format!(
+            "ws://{authority}/v1/realtime?mode={}&token={}",
+            mode.as_str(),
+            path_segment(token)
+        ))
+    }
+
+    enum Command {
+        Text(String),
+        Pcm(Vec<u8>),
+        Close,
+    }
+
+    #[derive(Default)]
+    struct Handlers {
+        events: Mutex<Vec<Arc<dyn Fn(Event) + Send + Sync + 'static>>>,
+        audio: Mutex<Vec<Arc<dyn Fn(&[u8]) + Send + Sync + 'static>>>,
+    }
+
+    fn dispatch(handlers: &Handlers, message: Message) {
+        match message {
+            Message::Text(text) => {
+                let Ok(value) = serde_json::from_str::<Value>(text.as_ref()) else {
+                    return;
+                };
+                let Some(kind) = value.get("type").and_then(Value::as_str) else {
+                    return;
+                };
+                let event = Event {
+                    kind: kind.to_owned(),
+                    text: value
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    json: value,
+                };
+                let listeners = handlers.events.lock().unwrap().clone();
+                for listener in listeners {
+                    listener(event.clone());
+                }
+            }
+            Message::Binary(frame) if frame.first() == Some(&0x01) => {
+                let pcm = frame[1..].to_vec();
+                let listeners = handlers.audio.lock().unwrap().clone();
+                for listener in listeners {
+                    listener(&pcm);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start(url: String) -> Result<Session, String> {
+        let (init_tx, init_rx) = mpsc::channel();
+        let (commands, mut command_rx) = tokio_mpsc::unbounded_channel();
+        let handlers = Arc::new(Handlers::default());
+        let thread_handlers = handlers.clone();
+        std::thread::Builder::new()
+            .name("olgp-realtime".into())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = init_tx.send(Err(format!("realtime runtime: {error}")));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let mut stream = match tokio::time::timeout(READ_TIMEOUT, connect_async(url))
+                        .await
+                    {
+                        Ok(Ok((stream, _))) => stream,
+                        Ok(Err(error)) => {
+                            let _ = init_tx.send(Err(format!("realtime connect: {error}")));
+                            return;
+                        }
+                        Err(_) => {
+                            let _ = init_tx.send(Err("realtime connect timed out".into()));
+                            return;
+                        }
+                    };
+                    let _ = init_tx.send(Ok(()));
+                    loop {
+                        tokio::select! {
+                            message = stream.next() => match message {
+                                Some(Ok(message)) => {
+                                    let closing = matches!(message, Message::Close(_));
+                                    dispatch(&thread_handlers, message);
+                                    if closing {
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            },
+                            command = command_rx.recv() => match command {
+                                Some(Command::Text(text)) => {
+                                    if stream.send(Message::Text(text.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Command::Pcm(frame)) => {
+                                    if stream.send(Message::Binary(frame.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Command::Close) | None => {
+                                    let _ = stream.close(None).await;
+                                    break;
+                                }
+                            },
+                        }
+                    }
+                });
+            })
+            .map_err(|error| format!("realtime thread: {error}"))?;
+        match init_rx.recv_timeout(READ_TIMEOUT + std::time::Duration::from_secs(1)) {
+            Ok(Ok(())) => Ok(Session {
+                commands,
+                handlers,
+                closed: AtomicBool::new(false),
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(error) => Err(format!("realtime connect: {error}")),
+        }
+    }
+
+    /// Open a session with the environment defaults used by [`connect`](super::connect).
+    ///
+    /// # Errors
+    /// Returns a description when connection or authentication fails.
+    pub fn connect(mode: Mode) -> Result<Session, String> {
+        connect_box(None, mode)
+    }
+
+    /// Open a session for a paired box id, an `http://host[:port]` base URL, or the defaults.
+    ///
+    /// # Errors
+    /// Returns a description when the credential or connection is invalid.
+    pub fn connect_box(box_id: Option<&str>, mode: Mode) -> Result<Session, String> {
+        let client = super::connect(box_id)?;
+        connect_from_runtime(&client.chat.completions.inner, mode)
+    }
+
+    pub(crate) fn connect_from_runtime(
+        inner: &Arc<Runtime>,
+        mode: Mode,
+    ) -> Result<Session, String> {
+        start(realtime_url(&http_base(&inner.host, inner.port), mode, &inner.token)?)
+    }
+
+    /// An open voice-v1 session. Callbacks run on the socket thread.
+    pub struct Session {
+        commands: tokio_mpsc::UnboundedSender<Command>,
+        handlers: Arc<Handlers>,
+        closed: AtomicBool,
+    }
+
+    impl Session {
+        /// Send raw PCM S16LE bytes; the `0x01` frame tag is added here.
+        ///
+        /// # Errors
+        /// Returns a description when the session is closed.
+        pub fn send_pcm(&self, pcm: &[u8]) -> Result<(), String> {
+            let mut frame = Vec::with_capacity(pcm.len() + 1);
+            frame.push(0x01);
+            frame.extend_from_slice(pcm);
+            self.post(Command::Pcm(frame))
+        }
+
+        /// Send a partial transcript as `text_input`.
+        ///
+        /// # Errors
+        /// Returns a description when the session is closed.
+        pub fn send_text(&self, text: &str) -> Result<(), String> {
+            self.post(Command::Text(json!({"type": "text_input", "text": text}).to_string()))
+        }
+
+        /// Commit the current turn.
+        ///
+        /// # Errors
+        /// Returns a description when the session is closed.
+        pub fn commit(&self) -> Result<(), String> {
+            self.post(Command::Text(json!({"type": "commit"}).to_string()))
+        }
+
+        /// Cancel the current turn.
+        ///
+        /// # Errors
+        /// Returns a description when the session is closed.
+        pub fn cancel(&self) -> Result<(), String> {
+            self.post(Command::Text(json!({"type": "cancel"}).to_string()))
+        }
+
+        /// Reset the session and its turn count.
+        ///
+        /// # Errors
+        /// Returns a description when the session is closed.
+        pub fn reset(&self) -> Result<(), String> {
+            self.post(Command::Text(json!({"type": "reset"}).to_string()))
+        }
+
+        /// Register a control-event listener.
+        pub fn on_event<F>(&self, listener: F)
+        where
+            F: Fn(Event) + Send + Sync + 'static,
+        {
+            self.handlers.events.lock().unwrap().push(Arc::new(listener));
+        }
+
+        /// Register a listener for PCM audio frames, without the `0x01` tag.
+        pub fn on_audio<F>(&self, listener: F)
+        where
+            F: Fn(&[u8]) + Send + Sync + 'static,
+        {
+            self.handlers.audio.lock().unwrap().push(Arc::new(listener));
+        }
+
+        /// Close the WebSocket. Safe to call more than once.
+        pub fn close(&self) {
+            self.shutdown();
+        }
+
+        fn post(&self, command: Command) -> Result<(), String> {
+            if self.closed.load(Ordering::Relaxed) {
+                return Err("olgp: realtime session is closed".into());
+            }
+            self.commands
+                .send(command)
+                .map_err(|_| "olgp: realtime session is closed".into())
+        }
+
+        fn shutdown(&self) {
+            if !self.closed.swap(true, Ordering::Relaxed) {
+                let _ = self.commands.send(Command::Close);
+            }
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const BOX_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn builds_realtime_url_with_mode_and_token() {
+        assert_eq!(
+            realtime::realtime_url("http://olgp.local:8787", realtime::Mode::Voice, "abc123")
+                .unwrap(),
+            "ws://olgp.local:8787/v1/realtime?mode=voice&token=abc123"
+        );
+        assert_eq!(
+            realtime::realtime_url("http://[::1]:8787", realtime::Mode::Chat, "a+b/c=").unwrap(),
+            "ws://[::1]:8787/v1/realtime?mode=chat&token=a%2Bb%2Fc%3D"
+        );
+        assert!(realtime::realtime_url("ftp://olgp.local", realtime::Mode::Voice, "t").is_err());
+    }
 
     #[test]
     fn builds_request_with_token_and_json_body() {

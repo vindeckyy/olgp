@@ -29,6 +29,7 @@ public enum OLGPUtilsError: Error {
     case invalidURL
     case badResponse
     case jobTimeout
+    case invalidMode
 }
 
 public final class Client {
@@ -524,6 +525,194 @@ public final class Client {
         try await audioRecordingsGet(recordingId)
     }
 
+    // MARK: - Realtime
+
+    public func realtimeConnect(mode: RealtimeMode) async throws -> RealtimeSession {
+        try await realtimeConnect(mode: mode.rawValue)
+    }
+
+    public func realtimeConnect(mode: String) async throws -> RealtimeSession {
+        guard mode == "voice" || mode == "chat" else { throw OLGPUtilsError.invalidMode }
+        let endpoint = baseURL.appendingPathComponent("/v1/realtime")
+        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased() else {
+            throw OLGPUtilsError.invalidURL
+        }
+        switch scheme {
+        case "http": components.scheme = "ws"
+        case "https": components.scheme = "wss"
+        case "ws", "wss": break
+        default: throw OLGPUtilsError.invalidURL
+        }
+        components.queryItems = [
+            URLQueryItem(name: "mode", value: mode),
+            URLQueryItem(name: "token", value: token),
+        ]
+        guard let url = components.url else { throw OLGPUtilsError.invalidURL }
+        let socket = URLSession.shared.webSocketTask(with: url)
+        let session = RealtimeSession(socket: socket)
+        socket.resume()
+        session.startReceiving()
+        return session
+    }
+
+}
+
+public enum RealtimeMode: String, Sendable {
+    case voice
+    case chat
+}
+
+public struct RealtimeAudioFormat: Codable, Sendable {
+    public let format: String
+    public let sampleRate: Int
+    public let channels: Int
+}
+
+public struct RealtimeEvent: Codable, Sendable {
+    public let type: String
+    public let sessionId: String?
+    public let mode: String?
+    public let protocolVersion: Int?
+    public let audio: RealtimeAudioFormat?
+    public let text: String?
+    public let code: String?
+    public let message: String?
+    public let retryable: Bool?
+    public let reason: String?
+
+    public init(
+        type: String,
+        sessionId: String? = nil,
+        mode: String? = nil,
+        protocolVersion: Int? = nil,
+        audio: RealtimeAudioFormat? = nil,
+        text: String? = nil,
+        code: String? = nil,
+        message: String? = nil,
+        retryable: Bool? = nil,
+        reason: String? = nil
+    ) {
+        self.type = type
+        self.sessionId = sessionId
+        self.mode = mode
+        self.protocolVersion = protocolVersion
+        self.audio = audio
+        self.text = text
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.reason = reason
+    }
+}
+
+public actor RealtimeSession {
+    private let socket: URLSessionWebSocketTask
+    private var receiver: Task<Void, Never>?
+    private var eventHandler: (@Sendable (RealtimeEvent) async -> Void)?
+    private var audioHandler: (@Sendable (Data) async -> Void)?
+    private var closed = false
+
+    public private(set) var ready: RealtimeEvent?
+
+    fileprivate init(socket: URLSessionWebSocketTask) {
+        self.socket = socket
+    }
+
+    fileprivate func startReceiving() {
+        receiver = Task { [weak self] in
+            await self?.receiveLoop()
+        }
+    }
+
+    public func onEvent(_ handler: @escaping @Sendable (RealtimeEvent) async -> Void) {
+        eventHandler = handler
+    }
+
+    public func onAudio(_ handler: @escaping @Sendable (Data) async -> Void) {
+        audioHandler = handler
+    }
+
+    public func sendPcm(_ pcm: Data) async throws {
+        var frame = Data([0x01])
+        frame.append(pcm)
+        try await socket.send(.data(frame))
+    }
+
+    public func sendText(_ text: String) async throws {
+        try await sendControl(type: "text_input", text: text)
+    }
+
+    public func commit() async throws {
+        try await sendControl(type: "commit")
+    }
+
+    public func cancel() async throws {
+        try await sendControl(type: "cancel")
+    }
+
+    public func reset() async throws {
+        try await sendControl(type: "reset")
+    }
+
+    public func close() {
+        closed = true
+        receiver?.cancel()
+        receiver = nil
+        socket.cancel()
+    }
+
+    private func sendControl(type: String, text: String? = nil) async throws {
+        struct Control: Encodable {
+            let type: String
+            let text: String?
+        }
+        let data = try JSONEncoder().encode(Control(type: type, text: text))
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw OLGPUtilsError.badResponse
+        }
+        try await socket.send(.string(json))
+    }
+
+    private func receiveLoop() async {
+        while !Task.isCancelled {
+            do {
+                switch try await socket.receive() {
+                case .string(let text):
+                    guard let data = text.data(using: .utf8),
+                          let event = try? JSONDecoder().decode(RealtimeEvent.self, from: data)
+                    else { continue }
+                    deliver(event)
+                case .data(let frame):
+                    // voice-v1 prefixes PCM S16LE payloads with one 0x01 byte.
+                    guard frame.first == 0x01 else { continue }
+                    deliverAudio(Data(frame.dropFirst()))
+                @unknown default:
+                    continue
+                }
+            } catch {
+                if !closed {
+                    deliver(RealtimeEvent(type: "error", message: error.localizedDescription))
+                }
+                return
+            }
+        }
+    }
+
+    private func deliver(_ event: RealtimeEvent) {
+        if event.type == "ready" { ready = event }
+        guard let handler = eventHandler else { return }
+        Task { await handler(event) }
+    }
+
+    private func deliverAudio(_ pcm: Data) {
+        guard let handler = audioHandler else { return }
+        Task { await handler(pcm) }
+    }
+}
+
+public func realtimeConnect(mode: RealtimeMode) async throws -> RealtimeSession {
+    try await Client().realtimeConnect(mode: mode)
 }
 
 public func connect(

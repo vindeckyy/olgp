@@ -6,6 +6,8 @@ pairing logic locally.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import os
 import subprocess
@@ -14,7 +16,7 @@ import urllib.request
 from urllib.error import HTTPError
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 __all__ = [
     "audio",
@@ -23,6 +25,7 @@ __all__ = [
     "connect",
     "discover",
     "pair",
+    "RealtimeSession",
     "engine",
     "speakers",
     "timers",
@@ -34,6 +37,131 @@ __all__ = [
     "recordings",
 ]
 
+
+
+class RealtimeSession:
+    """One voice-v1 WebSocket session."""
+
+    def __init__(self, websocket: Any) -> None:
+        self._ws = websocket
+        self._events: asyncio.Queue[Any] = asyncio.Queue()
+        self._event_callbacks: list[Any] = []
+        self._audio_callbacks: list[Any] = []
+        self._closed = False
+        self._reader = asyncio.create_task(self._read())
+
+    def on_event(self, callback: Any) -> Any:
+        self._event_callbacks.append(callback)
+        return callback
+
+    def on_audio(self, callback: Any) -> Any:
+        self._audio_callbacks.append(callback)
+        return callback
+
+    async def events(self) -> Any:
+        while True:
+            event = await self._events.get()
+            if event is None:
+                return
+            yield event
+
+    async def send_pcm(self, pcm: bytes) -> None:
+        await self._send(b"\x01" + bytes(pcm))
+
+    async def send_text(self, text: str) -> None:
+        await self._send_json({"type": "text_input", "text": text})
+
+    async def commit(self) -> None:
+        await self._send_json({"type": "commit"})
+
+    async def cancel(self) -> None:
+        await self._send_json({"type": "cancel"})
+
+    async def reset(self) -> None:
+        await self._send_json({"type": "reset"})
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await self._ws.close()
+        if self._reader is not None and self._reader is not asyncio.current_task():
+            self._reader.cancel()
+            try:
+                await self._reader
+            except asyncio.CancelledError:
+                pass
+        self._events.put_nowait(None)
+
+    async def _send(self, frame: Any) -> None:
+        if self._closed:
+            raise RuntimeError("realtime session is closed")
+        await self._ws.send(frame)
+
+    async def _send_json(self, event: dict[str, Any]) -> None:
+        await self._send(json.dumps(event))
+
+    async def _read(self) -> None:
+        try:
+            while True:
+                frame = await self._ws.recv()
+                if isinstance(frame, bytes):
+                    pcm = frame[1:] if frame[:1] == b"\x01" else frame
+                    for callback in tuple(self._audio_callbacks):
+                        await self._emit(callback, pcm)
+                    self._events.put_nowait({"type": "audio", "audio": pcm})
+                    continue
+                try:
+                    event = json.loads(frame)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(event, dict):
+                    event = {"type": "message", "data": event}
+                for callback in tuple(self._event_callbacks):
+                    await self._emit(callback, event)
+                self._events.put_nowait(event)
+        except Exception as exc:
+            if not self._closed:
+                event = {
+                    "type": "error",
+                    "code": "connection_closed",
+                    "message": str(exc),
+                    "retryable": False,
+                }
+                for callback in tuple(self._event_callbacks):
+                    await self._emit(callback, event)
+                self._events.put_nowait(event)
+        finally:
+            self._events.put_nowait(None)
+
+    @staticmethod
+    async def _emit(callback: Any, value: Any) -> None:
+        result = callback(value)
+        if inspect.isawaitable(result):
+            await result
+
+
+class _Realtime:
+    """Realtime sessions bound to a paired client."""
+
+    def __init__(self, client: "Client") -> None:
+        self._client = client
+
+    async def connect(self, mode: str = "voice") -> RealtimeSession:
+        if mode not in ("voice", "chat"):
+            raise ValueError("mode must be 'voice' or 'chat'")
+        try:
+            import websockets
+        except ImportError as exc:
+            raise RuntimeError(
+                "websockets is required for realtime; install it with `pip install websockets`"
+            ) from exc
+        parts = urlsplit(self._client.base_url)
+        scheme = "wss" if parts.scheme in ("https", "wss") else "ws"
+        path = parts.path.rstrip("/") + "/v1/realtime"
+        query = urlencode({"mode": mode, "token": self._client.token})
+        url = urlunsplit((scheme, parts.netloc, path, query, ""))
+        return RealtimeSession(await websockets.connect(url))
 
 
 class _Module:
@@ -437,6 +565,10 @@ class Client:
     @property
     def audio(self) -> "_Audio":
         return _Audio(self.recordings)
+
+    @property
+    def realtime(self) -> "_Realtime":
+        return _Realtime(self)
 
     def chat(self, model: str, message: str | list[dict[str, Any]]) -> str:
         """Send one chat completion request and return the reply text."""

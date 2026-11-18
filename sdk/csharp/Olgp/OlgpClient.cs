@@ -1,4 +1,6 @@
 using System.Net.Http.Json;
+using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
 using System.Runtime.CompilerServices;
 
@@ -17,6 +19,7 @@ internal sealed record MessageWrapper(string Content);
 public sealed class OlgpClient
 {
     private readonly HttpClient _http;
+    private readonly string? _token;
     private readonly string? _memoryToken;
 
     public OlgpClient(
@@ -31,6 +34,7 @@ public sealed class OlgpClient
             ?? "http://olgp.local:8787";
         _http = new HttpClient { BaseAddress = new Uri(address) };
         var credential = token ?? Environment.GetEnvironmentVariable("OLGP_DEVICE_TOKEN") ?? "";
+        _token = credential;
         _http.DefaultRequestHeaders.Add("Authorization", $"Bearer {credential}");
         _memoryToken = memoryToken ?? Environment.GetEnvironmentVariable("OLGP_MEMORY_TOKEN");
         searchProvider ??= Environment.GetEnvironmentVariable("OLGP_SEARCH_PROVIDER");
@@ -54,6 +58,7 @@ public sealed class OlgpClient
         AudioRecordings = new RecordingRoutes(this);
         Audio = new AudioRoutes(this);
         Engine = new EngineRoutes(this);
+        Realtime = new RealtimeRoutes(this);
     }
 
     public SpeakerRoutes Speakers { get; }
@@ -66,6 +71,7 @@ public sealed class OlgpClient
     public RecordingRoutes AudioRecordings { get; }
     public AudioRoutes Audio { get; }
     public EngineRoutes Engine { get; }
+    public RealtimeRoutes Realtime { get; }
 
     public async Task<string> ChatAsync(string model, IEnumerable<ChatMessage> messages)
     {
@@ -580,6 +586,223 @@ public sealed class OlgpClient
                 HttpMethod.Get,
                 $"/v1/audio/recordings/{Uri.EscapeDataString(recordingId)}"
             );
+    }
+
+    public sealed class RealtimeRoutes(OlgpClient client)
+    {
+        public Task<RealtimeSession> ConnectAsync(
+            string mode,
+            CancellationToken cancellationToken = default) =>
+            RealtimeSession.ConnectAsync(client, mode, cancellationToken);
+    }
+
+    public sealed class RealtimeSession
+    {
+        private static readonly byte[] CommitFrame = "{\"type\":\"commit\"}"u8.ToArray();
+        private static readonly byte[] CancelFrame = "{\"type\":\"cancel\"}"u8.ToArray();
+        private static readonly byte[] ResetFrame = "{\"type\":\"reset\"}"u8.ToArray();
+
+        private readonly ClientWebSocket _socket;
+        private readonly SemaphoreSlim _sendLock = new(1, 1);
+        private readonly object _eventLock = new();
+        private readonly Queue<JsonElement> _pendingEvents = new();
+        private readonly Task _receiveTask;
+        private Action<JsonElement>? _onEvent;
+        private int _closed;
+
+        public Action<JsonElement>? OnEvent
+        {
+            get { lock (_eventLock) return _onEvent; }
+            set
+            {
+                JsonElement[] pending;
+                lock (_eventLock)
+                {
+                    _onEvent = value;
+                    if (value is null)
+                    {
+                        return;
+                    }
+                    pending = _pendingEvents.ToArray();
+                    _pendingEvents.Clear();
+                }
+                foreach (var item in pending)
+                {
+                    value(item);
+                }
+            }
+        }
+
+        public Action<ReadOnlyMemory<byte>>? OnAudio { get; set; }
+
+        private RealtimeSession(ClientWebSocket socket)
+        {
+            _socket = socket;
+            _receiveTask = ReceiveLoopAsync();
+            _ = _receiveTask.ContinueWith(
+                static task => _ = task.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        internal static async Task<RealtimeSession> ConnectAsync(
+            OlgpClient client,
+            string mode,
+            CancellationToken cancellationToken)
+        {
+            if (mode is not ("voice" or "chat"))
+            {
+                throw new ArgumentOutOfRangeException(nameof(mode), mode, "mode must be 'voice' or 'chat'");
+            }
+            var builder = new UriBuilder(client._http.BaseAddress!)
+            {
+                Path = "/v1/realtime",
+                Query = $"mode={Uri.EscapeDataString(mode)}&token={Uri.EscapeDataString(client._token ?? "")}"
+            };
+            builder.Scheme = builder.Scheme switch
+            {
+                "https" => "wss",
+                "http" => "ws",
+                _ => builder.Scheme
+            };
+            var socket = new ClientWebSocket();
+            try
+            {
+                await socket.ConnectAsync(builder.Uri, cancellationToken).ConfigureAwait(false);
+                return new RealtimeSession(socket);
+            }
+            catch
+            {
+                socket.Dispose();
+                throw;
+            }
+        }
+
+        public Task SendPcmAsync(ReadOnlyMemory<byte> pcm, CancellationToken cancellationToken = default)
+        {
+            var frame = new byte[pcm.Length + 1];
+            frame[0] = 0x01;
+            pcm.CopyTo(frame.AsMemory(1));
+            return SendAsync(frame, WebSocketMessageType.Binary, cancellationToken);
+        }
+
+        public Task SendTextAsync(string text, CancellationToken cancellationToken = default) =>
+            SendAsync(
+                JsonSerializer.SerializeToUtf8Bytes(new { type = "text_input", text }),
+                WebSocketMessageType.Text,
+                cancellationToken);
+
+        public Task CommitAsync(CancellationToken cancellationToken = default) =>
+            SendAsync(CommitFrame, WebSocketMessageType.Text, cancellationToken);
+
+        public Task CancelAsync(CancellationToken cancellationToken = default) =>
+            SendAsync(CancelFrame, WebSocketMessageType.Text, cancellationToken);
+
+        public Task ResetAsync(CancellationToken cancellationToken = default) =>
+            SendAsync(ResetFrame, WebSocketMessageType.Text, cancellationToken);
+
+        public async Task CloseAsync(CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Exchange(ref _closed, 1) != 0)
+            {
+                return;
+            }
+            try
+            {
+                if (_socket.State == WebSocketState.Open)
+                {
+                    await _socket.CloseOutputAsync(
+                        WebSocketCloseStatus.NormalClosure,
+                        "client closed",
+                        cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (WebSocketException) { }
+            catch (OperationCanceledException) { }
+            _socket.Abort();
+            _socket.Dispose();
+        }
+
+        private async Task SendAsync(
+            ReadOnlyMemory<byte> payload,
+            WebSocketMessageType messageType,
+            CancellationToken cancellationToken)
+        {
+            ThrowIfClosed();
+            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ThrowIfClosed();
+                await _socket.SendAsync(payload, messageType, endOfMessage: true, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        private void ThrowIfClosed()
+        {
+            if (Volatile.Read(ref _closed) != 0 || _socket.State != WebSocketState.Open)
+            {
+                throw new InvalidOperationException("realtime session is closed");
+            }
+        }
+
+        private async Task ReceiveLoopAsync()
+        {
+            var buffer = new byte[64 * 1024];
+            try
+            {
+                while (_socket.State == WebSocketState.Open)
+                {
+                    using var frame = new MemoryStream();
+                    WebSocketReceiveResult result;
+                    do
+                    {
+                        result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None)
+                            .ConfigureAwait(false);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            return;
+                        }
+                        frame.Write(buffer, 0, result.Count);
+                    } while (!result.EndOfMessage);
+
+                    var payload = frame.ToArray();
+                    if (result.MessageType == WebSocketMessageType.Text)
+                    {
+                        DispatchEvent(OlgpClient.Parse(Encoding.UTF8.GetString(payload)));
+                    }
+                    else if (result.MessageType == WebSocketMessageType.Binary
+                        && payload.Length > 0
+                        && payload[0] == 0x01)
+                    {
+                        OnAudio?.Invoke(new ReadOnlyMemory<byte>(payload, 1, payload.Length - 1));
+                    }
+                }
+            }
+            catch (WebSocketException) { }
+            catch (ObjectDisposedException) { }
+            catch (OperationCanceledException) { }
+        }
+
+        private void DispatchEvent(JsonElement item)
+        {
+            Action<JsonElement>? handler;
+            lock (_eventLock)
+            {
+                handler = _onEvent;
+                if (handler is null)
+                {
+                    _pendingEvents.Enqueue(item);
+                    return;
+                }
+            }
+            handler(item);
+        }
     }
 }
 
