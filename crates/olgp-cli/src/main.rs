@@ -374,9 +374,24 @@ fn command_pairing_show() -> Result<(), String> {
     print!("{code}");
     Ok(())
 }
+
+fn command_runtime_check(args: &[String]) -> Result<(), String> {
+    let box_id = args.first().ok_or("usage: olgpctl runtime check <box-id>")?;
+    let cred = credential(box_id)?;
+    let box_info = discover_box(box_id)?;
+    let api = TcpStream::connect((box_info.address, box_info.api_port)).is_ok();
+    let rpc = TcpStream::connect((box_info.address, box_info.rpc_port)).is_ok();
+    if !api || !rpc {
+        return Err(format!("runtime check: api_ok={api} rpc_ok={rpc}"));
+    }
+    let driver = if ShimPaths::default().config.exists() { "attached" } else { "detached" };
+    println!("runtime ok, api ok, rpc ok, driver {driver}, token {}", &cred.token[..8]);
+    Ok(())
+}
+
 fn print_help() {
     println!("olgpctl <command> [args]");
-    println!("commands: setup, discover, pairing show, pair, doctor, attach, detach, install-driver, venus, status, models, cache, bench");
+    println!("commands: setup, discover, pairing show, pair, doctor, runtime check, attach, detach, install-driver, venus, status, models, cache, bench");
 }
 
 fn main() -> Result<(), String> {
@@ -444,6 +459,7 @@ fn main() -> Result<(), String> {
         }
         "pair" => command_pair(rest),
         "pairing" if rest.first().map(String::as_str) == Some("show") => command_pairing_show(),
+        "runtime" if rest.first().map(String::as_str) == Some("check") => command_runtime_check(&rest[1..]),
         "doctor" => {
             let box_id = rest.first().ok_or("usage: olgpctl doctor <box-id>")?;
             let cred = credential(box_id)?;
