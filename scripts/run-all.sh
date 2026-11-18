@@ -50,6 +50,7 @@ run quickstart_script bash -n scripts/quickstart.sh
 run kernel scripts/check-kernel.sh
 run bench_models scripts/bench-models.sh
 
+run api_compat scripts/check-api-compat.sh
 if [[ "${OLGP_E2E:-0}" == "1" ]]; then
   run rtt scripts/bench-rtt.sh
   run cuda scripts/cuda-e2e.sh

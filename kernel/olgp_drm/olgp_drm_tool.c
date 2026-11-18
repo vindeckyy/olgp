@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-#include "olgp_drm.h"
+#include "olgp_abi.h"
 
 #include <fcntl.h>
 #include <stdio.h>

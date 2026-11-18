@@ -6,10 +6,14 @@ python3 - <<'PY'
 import pathlib
 
 required = {
-    "kernel/olgp_drm/olgp_drm.h": [
+    "kernel/olgp_drm/olgp_abi.h": [
         "OLGP_IOC_SUBMIT",
         "OLGP_IOC_RECV",
         "OLGP_PCI_VENDOR",
+        "struct olgp_submit",
+    ],
+    "kernel/olgp_drm/olgp_drm.h": [
+        "olgp_abi.h",
         "struct olgp_drm",
     ],
     "kernel/olgp_drm/olgp_drv.c": [
@@ -24,7 +28,7 @@ required = {
         "wait_event_interruptible",
     ],
     "kernel/olgp_drm/olgp_gem.c": ["drm_gem_object_init"],
-    "kernel/olgp_drm/olgp_drm_tool.c": ["OLGP_IOC_SUBMIT", "OLGP_IOC_RECV"],
+    "kernel/olgp_drm/olgp_drm_tool.c": ["olgp_abi.h", "OLGP_IOC_SUBMIT", "OLGP_IOC_RECV"],
     "kernel/olgp_drm/Makefile": ["obj-m", "olgp_drm_tool"],
 }
 for path, needles in required.items():
