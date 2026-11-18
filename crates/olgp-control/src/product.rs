@@ -246,13 +246,17 @@ impl ProductState {
             }
             ("GET", "/v1/audio-memory/settings") => Some(ok(json!(store.settings()))),
             ("PATCH", "/v1/audio-memory/settings") => {
+                let current = store.settings();
                 let settings = Settings {
-                    mode: field(request, "mode").unwrap_or_else(|| "disabled".into()),
-                    retention_days: number(request, "retention_days").unwrap_or(30) as u32,
-                    revision: number(request, "revision").unwrap_or(1) as u32,
+                    mode: field(request, "mode").unwrap_or_else(|| current.mode.clone()),
+                    retention_days: number(request, "retention_days")
+                        .unwrap_or(u64::from(current.retention_days)) as u32,
+                    revision: number(request, "revision")
+                        .map(|value| value as u32)
+                        .unwrap_or_else(|| current.revision.saturating_add(1)),
                     capture_epoch: field(request, "captureEpoch")
                         .or_else(|| field(request, "capture_epoch"))
-                        .unwrap_or_else(|| "2026-01-01T00:00:00Z".into()),
+                        .unwrap_or_else(|| current.capture_epoch.clone()),
                 };
                 Some(mutation(store.set_settings(settings).map(|()| json!({"accepted":true}))))
             }
