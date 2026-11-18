@@ -147,6 +147,10 @@ pub async fn serve(socket: TcpStream, mode: VoiceMode) -> Result<(), String> {
                         }
                     }
                     "commit" => {
+                        stream
+                            .send(text_frame(json!({"type":"input_committed"})))
+                            .await
+                            .map_err(|e| e.to_string())?;
                         if let Some(text) = session.decide(GateInput {
                             repeat_count: 2,
                             answer_length: 4,
@@ -303,6 +307,8 @@ mod tests {
             .send(Message::Text(json!({"type":"commit"}).to_string().into()))
             .await
             .unwrap();
+        let committed = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(committed.contains("input_committed"));
         let final_text = client.next().await.unwrap().unwrap().into_text().unwrap();
         assert!(final_text.contains("\"type\":\"text\""));
         let end = client.next().await.unwrap().unwrap().into_text().unwrap();
@@ -420,6 +426,7 @@ mod tests {
             .unwrap();
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("text_tentative"));
         client.send(Message::Text(json!({"type":"commit"}).to_string().into())).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("input_committed"));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"text\""));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
 
@@ -466,6 +473,7 @@ mod tests {
             .unwrap();
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("text_tentative"));
         client.send(Message::Text(json!({"type":"commit"}).to_string().into())).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("input_committed"));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"text\""));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
         let error = client.next().await.unwrap().unwrap().into_text().unwrap();
