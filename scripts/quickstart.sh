@@ -16,11 +16,13 @@ Setup complete.
 
 On this box, run:
   target/release/olgp-node --config $DIR/node.toml
+  target/release/olgpctl pairing show
 
-On a paired client, run:
+On a client, run:
   olgpctl discover
-  olgpctl pair <box-id> --code <one-time-code>
+  olgpctl pair <box-id> --code <six-digit-code>
   sudo olgpctl attach --box <box-id>
   nvidia-smi -L
+  olgp-smi
 
 EOF

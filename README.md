@@ -70,11 +70,13 @@ GPU machine and the installed shim.
 
 ```sh
 olgpctl discover
+olgpctl pairing show
 olgpctl pair <box-id> --code <six-digit-code>
 olgpctl doctor <box-id>
 sudo olgpctl attach --box <box-id>
 nvidia-smi -L
 sudo olgpctl detach
+olgp-smi
 ```
 
 `attach` is system-wide and reversible; it keeps a backup of the dynamic
