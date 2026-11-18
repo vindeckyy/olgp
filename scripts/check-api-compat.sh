@@ -36,6 +36,12 @@ engine=$!
 OLGP_CONFIG="$WORK/node.toml" OLGP_SPKI_PATH="$WORK/spki.sha256" \
 OLGP_PAIRING_CODE_PATH="$WORK/pairing.code" \
 OLGP_CERT_PATH="$WORK/tls/cert.pem" OLGP_KEY_PATH="$WORK/tls/key.pem" \
+OLGP_HOUSEHOLD_PATH="$WORK/household.json" \
+OLGP_MEMORY_PATH="$WORK/memory.json" \
+OLGP_SPEAKER_PATH="$WORK/speakers.json" \
+OLGP_RAG_PATH="$WORK/rag.json" \
+OLGP_IMAGES_PATH="$WORK/images.json" \
+OLGP_RECORDINGS_ROOT="$WORK/recordings" \
 cargo run -q -p olgp-node >"$WORK/node.log" 2>&1 &
 node=$!
 trap 'kill $engine $node >/dev/null 2>&1 || true' EXIT

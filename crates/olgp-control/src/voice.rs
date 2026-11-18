@@ -142,6 +142,39 @@ pub async fn serve(socket: TcpStream) -> Result<(), String> {
     Ok(())
 }
 
+/// Serve one speaker PCM stream. Frames are acknowledged, not forwarded to
+/// physical hardware from this protocol repo.
+///
+/// # Errors
+/// Returns a WebSocket or IO error when the connection fails.
+pub async fn serve_speaker_audio(socket: TcpStream) -> Result<(), String> {
+    let mut stream: WebSocketStream<TcpStream> = tokio_tungstenite::accept_async(socket)
+        .await
+        .map_err(|e| e.to_string())?;
+    stream
+        .send(text_frame(json!({
+            "type": "ready",
+            "protocolVersion": 1,
+            "audio": {"format": "pcm_s16le", "channels": 1}
+        })))
+        .await
+        .map_err(|e| e.to_string())?;
+    while let Some(message) = stream.next().await {
+        match message.map_err(|e| e.to_string())? {
+            Message::Binary(frame) if frame.first() == Some(&0x01) => {
+                let _ = trace_event("speaker_pcm");
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    stream
+        .send(text_frame(json!({"type":"closed"})))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +272,46 @@ mod tests {
             asr_confidence: 90,
             position: 50,
         }), None);
+    }
+
+    #[test]
+    fn short_high_confidence_answer_fires() {
+        assert!(should_speak(GateInput {
+            repeat_count: 1,
+            answer_length: 4,
+            copy_ratio: 35,
+            asr_confidence: 90,
+            position: 35,
+        }));
+    }
+
+    #[tokio::test]
+    async fn websocket_ignores_unknown_events_and_counts_pcm() {
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_tungstenite::client_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            serve(socket).await.unwrap();
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut client, _) = client_async("ws://127.0.0.1/realtime", stream).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("ready"));
+
+        client
+            .send(Message::Text(json!({"type":"stt_final","text":"done"}).to_string().into()))
+            .await
+            .unwrap();
+        client
+            .send(Message::Binary(vec![0x01, 0, 0, 0].into()))
+            .await
+            .unwrap();
+        client.send(Message::Text(json!({"type":"cancel"}).to_string().into())).await.unwrap();
+        let end = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(end.contains("\"type\":\"end\""));
+        client.close(None).await.unwrap();
+        let _ = server.await;
     }
 }

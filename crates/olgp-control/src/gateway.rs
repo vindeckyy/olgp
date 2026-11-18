@@ -18,6 +18,7 @@ use tokio_rustls::TlsAcceptor;
 use crate::config::Config;
 use tokio::io::copy_bidirectional;
 use crate::discovery::BoxInfo;
+use crate::product::ProductState;
 use crate::pairing::HostPairing;
 
 struct GatewayState {
@@ -28,6 +29,7 @@ struct GatewayState {
     pairing_attempts: Mutex<u32>,
     pairing_code: PairingCode,
     engine_port: u16,
+    product: Option<ProductState>,
 }
 fn response(status: &str, body: &str) -> Vec<u8> {
     format!(
@@ -153,6 +155,13 @@ async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
         tokio::spawn(crate::voice::serve(socket));
         return;
     }
+    if path.starts_with("/v1/speakers/")
+        && path.ends_with("/audio:stream")
+        && head.lines().any(|line| line.to_ascii_lowercase().contains("upgrade: websocket"))
+    {
+        tokio::spawn(crate::voice::serve_speaker_audio(socket));
+        return;
+    }
     let result = handle_request(&method, &path, &head, &body, &state).await;
     let _ = socket.write_all(&result).await;
 }
@@ -176,6 +185,17 @@ async fn handle_request(
                 "gpu": state.info.gpu,
                 "vram_mib": state.info.vram_mib,
                 "capabilities": state.info.capabilities,
+                "product": {
+                    "speaker": true,
+                    "timers": true,
+                    "memos": true,
+                    "audioMemory": true,
+                    "privateRag": true,
+                    "recordings": true,
+                    "images": true,
+                },
+                "search": {"policy": "caller-key"},
+                "memory": {"policy": "opt-in"},
                 "ready": true,
             })
             .to_string(),
@@ -244,6 +264,11 @@ async fn handle_request(
                 response("200 OK", "{\"window_open\":false}\n")
             }
         }
+        (_, _) if state.product.is_some() => state
+            .product
+            .as_ref()
+            .and_then(|product| product.handle(method, path, head, body))
+            .unwrap_or_else(|| error("invalid_request", "unknown route", "404 Not Found", false)),
         _ => error("invalid_request", "unknown route", "404 Not Found", false),
     }
 }
@@ -395,6 +420,7 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         .map_err(|e| format!("pairing code write: {e}"))?;
     std::fs::set_permissions(&code_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| format!("pairing code mode: {e}"))?;
+    let product = Some(ProductState::load()?);
     let state = Arc::new(GatewayState {
         info,
         identity: DeviceIdentity::generate().map_err(|e| e.to_string())?,
@@ -403,6 +429,7 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         pairing_attempts: Mutex::new(0),
         pairing_code,
         engine_port: config.engine_port,
+        product,
     });
     let upstream = SocketAddr::from(([127, 0, 0, 1], 14833));
 
@@ -456,6 +483,7 @@ mod tests {
             pairing_attempts: Mutex::new(0),
             pairing_code: PairingCode::new(123456),
             engine_port: 18080,
+            product: None,
         }
     }
 

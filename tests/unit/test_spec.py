@@ -8,8 +8,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 class SpecContractTest(unittest.TestCase):
     def test_contract_route_count(self) -> None:
         text = (ROOT / "spec/v1/contracts.md").read_text()
-        rows = re.findall(r"^\| (GET|POST|PATCH|WS) \|", text, re.M)
-        self.assertEqual(len(rows), 15)
+        rows = re.findall(r"^\| (GET|POST|PATCH|DELETE|WS) \|", text, re.M)
+        self.assertEqual(len(rows), 60)
 
     def test_txt_keys_are_nine(self) -> None:
         text = (ROOT / "spec/v1/txt-record.md").read_text()
