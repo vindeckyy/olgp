@@ -51,6 +51,7 @@ match, but the wire request shape does not.
   rejections with no credential written.
 - Live engine session: `POST /engine/sessions` returned a ready session and `GET /engine/sessions` listed it.
 - C++ `olgp_semantic_test` and `olgp_dispatch_test` pass.
+- SDK static checks: Swift `swiftc -parse` and TypeScript `Bun.build` pass; C# has no local compiler.
 
 ## Remaining structural non-parity
 
