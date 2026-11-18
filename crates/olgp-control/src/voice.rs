@@ -108,10 +108,17 @@ pub async fn serve(socket: TcpStream, mode: VoiceMode) -> Result<(), String> {
     let mut stream: WebSocketStream<TcpStream> = tokio_tungstenite::accept_async(socket)
         .await
         .map_err(|e| e.to_string())?;
+    let session_id = format!(
+        "sess-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     let ready = json!({
         "type": "ready",
         "protocolVersion": 1,
-        "sessionId": "olgp-voice",
+        "sessionId": session_id,
         "mode": mode.as_str(),
         "audio": {"format": "pcm_s16le", "sampleRate": 24000, "channels": 1}
     });
@@ -149,6 +156,10 @@ pub async fn serve(socket: TcpStream, mode: VoiceMode) -> Result<(), String> {
                     "commit" => {
                         stream
                             .send(text_frame(json!({"type":"input_committed"})))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        stream
+                            .send(text_frame(json!({"type":"stt_final","text":session.transcript.clone()})))
                             .await
                             .map_err(|e| e.to_string())?;
                         if let Some(text) = session.decide(GateInput {
@@ -284,6 +295,7 @@ mod tests {
             .unwrap();
         let ready = client.next().await.unwrap().unwrap().into_text().unwrap();
         assert!(ready.contains("\"type\":\"ready\""));
+        assert!(ready.contains("\"sessionId\":\"sess-"));
 
         client
             .send(Message::Text(
@@ -309,6 +321,7 @@ mod tests {
             .unwrap();
         let committed = client.next().await.unwrap().unwrap().into_text().unwrap();
         assert!(committed.contains("input_committed"));
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("stt_final"));
         let final_text = client.next().await.unwrap().unwrap().into_text().unwrap();
         assert!(final_text.contains("\"type\":\"text\""));
         let end = client.next().await.unwrap().unwrap().into_text().unwrap();
@@ -427,6 +440,7 @@ mod tests {
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("text_tentative"));
         client.send(Message::Text(json!({"type":"commit"}).to_string().into())).await.unwrap();
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("input_committed"));
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("stt_final"));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"text\""));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
 
@@ -474,6 +488,7 @@ mod tests {
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("text_tentative"));
         client.send(Message::Text(json!({"type":"commit"}).to_string().into())).await.unwrap();
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("input_committed"));
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("stt_final"));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"text\""));
         assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
         let error = client.next().await.unwrap().unwrap().into_text().unwrap();
