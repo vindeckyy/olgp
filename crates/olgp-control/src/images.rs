@@ -10,8 +10,51 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const OPERATIONS: [&str; 5] = ["generate", "edit", "face_swap", "reframe", "detect"];
+
+fn validate_request(operation: &str, request: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_str(request).map_err(|_| "invalid_request".to_owned())?;
+    let parameters = value.get("parameters");
+    let mut integer = |key: &str| -> Option<u64> {
+        parameters.and_then(|p| p.get(key)).and_then(Value::as_u64)
+    };
+    if let (Some(width), Some(height)) = (integer("width"), integer("height")) {
+        let (min, max, step) = if operation == "reframe" { (96, 1280, 1) } else { (64, 2048, 64) };
+        for dimension in [width, height] {
+            if !(min..=max).contains(&dimension) || dimension % step != 0 {
+                return Err(format!("invalid_parameter: {dimension}"));
+            }
+        }
+    }
+    if let Some(steps) = integer("steps") {
+        if !(1..=100).contains(&steps) {
+            return Err("invalid_parameter: steps".into());
+        }
+    }
+    if let Some(fps) = integer("fps") {
+        if !(8..=60).contains(&fps) {
+            return Err("invalid_parameter: fps".into());
+        }
+    }
+    if let Some(frames) = integer("frames") {
+        if !(8..=240).contains(&frames) {
+            return Err("invalid_parameter: frames".into());
+        }
+    }
+    if let Some(inputs) = value.get("inputs").and_then(Value::as_object) {
+        for (key, input) in inputs {
+            if key == "image" || key == "source" || key == "target" {
+                let text = input.as_str().unwrap_or("");
+                if text.len() > 20 * 1024 * 1024 {
+                    return Err("invalid_parameter: input too large".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// One image job. Nothing in this module advances a job to `succeeded`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,6 +127,7 @@ impl ImageStore {
         if request.trim().is_empty() {
             return Err("invalid_request".to_owned());
         }
+        validate_request(operation, request)?;
         let mut next = self.state.clone();
         next.next_id += 1;
         let job = ImageJob {
@@ -186,7 +230,7 @@ mod tests {
     fn create_persists_provisioning_state() {
         let file = StateFile::new("create");
         let mut store = ImageStore::load(&file.path()).unwrap();
-        let job = store.create("generate", "a cat").unwrap();
+        let job = store.create("generate", "{}").unwrap();
         assert_eq!(job.id, "img-1");
         assert_eq!(job.operation, "generate");
         assert_eq!(job.status, "model_missing");
@@ -209,10 +253,10 @@ mod tests {
     fn unsupported_operation_or_empty_request_is_rejected() {
         let file = StateFile::new("reject");
         let mut store = ImageStore::load(&file.path()).unwrap();
-        assert_eq!(store.create("upscale", "a cat"), Err("unsupported_operation: upscale".into()));
+        assert_eq!(store.create("upscale", "{}"), Err("unsupported_operation: upscale".into()));
         assert_eq!(store.create("generate", "  "), Err("invalid_request".into()));
         for op in OPERATIONS {
-            assert!(store.create(op, "request").is_ok());
+            assert!(store.create(op, "{}").is_ok());
         }
         assert_eq!(store.get("img-5").map(|j| j.operation.as_str()), Some("detect"));
     }
@@ -221,7 +265,7 @@ mod tests {
     fn result_is_unavailable_for_unfinished_jobs() {
         let file = StateFile::new("result");
         let mut store = ImageStore::load(&file.path()).unwrap();
-        let job = store.create("edit", "change sky").unwrap();
+        let job = store.create("edit", "{}").unwrap();
         assert_eq!(store.result(&job.id), Err("result_unavailable".into()));
         assert_eq!(store.result("missing"), Err("unknown_job".into()));
         store.cancel(&job.id).unwrap();
@@ -232,7 +276,7 @@ mod tests {
     fn cancel_marks_job_done_and_persists() {
         let file = StateFile::new("cancel");
         let mut store = ImageStore::load(&file.path()).unwrap();
-        let job = store.create("face_swap", "portrait").unwrap();
+        let job = store.create("face_swap", "{}").unwrap();
         let cancelled = store.cancel(&job.id).unwrap().unwrap();
         assert_eq!(cancelled.status, "cancelled");
         assert_eq!(cancelled.phase, "done");
@@ -246,10 +290,10 @@ mod tests {
     fn ids_keep_incrementing_after_reload() {
         let file = StateFile::new("ids");
         let mut store = ImageStore::load(&file.path()).unwrap();
-        store.create("generate", "one").unwrap();
-        store.create("generate", "two").unwrap();
+        store.create("generate", "{}").unwrap();
+        store.create("generate", "{}").unwrap();
         let mut store = ImageStore::load(&file.path()).unwrap();
-        assert_eq!(store.create("generate", "three").unwrap().id, "img-3");
+        assert_eq!(store.create("generate", "{}").unwrap().id, "img-3");
     }
 
     #[test]
@@ -285,5 +329,28 @@ mod tests {
         let file = StateFile::new("corrupt");
         fs::write(file.path(), "not json").unwrap();
         assert!(ImageStore::load(&file.path()).is_err());
+    }
+
+    #[test]
+    fn image_parameter_bounds_are_enforced() {
+        let file = StateFile::new("bounds");
+        let mut store = ImageStore::load(&file.path()).unwrap();
+        assert!(store.create("generate", "{\"parameters\":{\"width\":512,\"height\":512}}").is_ok());
+        assert!(store.create("generate", "{\"parameters\":{\"width\":100,\"height\":512}}").is_err());
+        assert!(store.create("generate", "{\"parameters\":{\"steps\":101}}").is_err());
+        assert!(store.create("reframe", "{\"parameters\":{\"width\":100,\"height\":100}}").is_ok());
+        assert!(store.create("reframe", "{\"parameters\":{\"fps\":4}}").is_err());
+    }
+
+    #[test]
+    fn image_validation_branches_are_exercised() {
+        let file = StateFile::new("bounds2");
+        let mut store = ImageStore::load(&file.path()).unwrap();
+        assert!(store.create("reframe", "{\"parameters\":{\"fps\":8,\"frames\":8}}").is_ok());
+        assert!(store.create("reframe", "{\"parameters\":{\"frames\":241}}").is_err());
+        assert!(store.create("detect", "{\"inputs\":{\"image\":\"data:image/png;base64,AA\"}}").is_ok());
+        let huge = "x".repeat(20 * 1024 * 1024 + 1);
+        assert!(store.create("detect", &format!("{{\"inputs\":{{\"image\":\"{huge}\"}}}}")).is_err());
+        assert!(store.create("generate", "not-json").is_err());
     }
 }
