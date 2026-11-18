@@ -179,5 +179,26 @@ class SdkTest(unittest.TestCase):
             or request.get_header("X-Wici-Tavily-Key") == "key"
         )
 
+
+    def test_image_result_bytes_and_save(self) -> None:
+        class RawResponse(FakeResponse):
+            headers = {"Content-Type": "image/png"}
+
+        client = olgp.Client("http://box:8787", "token")
+        payload = b"\x89PNG\r\n\x1a\n"
+        with mock.patch.object(
+            olgp.urllib.request, "urlopen", return_value=RawResponse(payload)
+        ):
+            data, content_type = client.images.jobs.result_bytes("img-1")
+        self.assertEqual(data, payload)
+        self.assertEqual(content_type, "image/png")
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "result.png"
+            with mock.patch.object(
+                olgp.urllib.request, "urlopen", return_value=RawResponse(payload)
+            ):
+                client.images.jobs.save("img-1", path)
+            self.assertEqual(path.read_bytes(), payload)
+
 if __name__ == "__main__":
     unittest.main()

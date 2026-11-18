@@ -251,55 +251,80 @@ fn with_search_headers(request: String, search: &SearchOptions) -> String {
     result
 }
 
-fn decode_chunked(body: &str) -> Result<String, String> {
+fn decode_chunked(body: &[u8]) -> Result<Vec<u8>, String> {
     let mut rest = body;
-    let mut out = String::new();
+    let mut out = Vec::new();
     loop {
-        let (size_line, tail) = rest
-            .split_once("\r\n")
+        let end = rest
+            .windows(2)
+            .position(|window| window[0] == b'\r' && window[1] == b'\n')
             .ok_or("malformed chunked response")?;
+        let size_line = std::str::from_utf8(&rest[..end])
+            .map_err(|_| "malformed chunk size".to_owned())?;
         let size_text = size_line.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_text, 16)
             .map_err(|error| format!("malformed chunk size: {error}"))?;
         if size == 0 {
             return Ok(out);
         }
+        let tail = &rest[end + 2..];
         if tail.len() < size {
             return Err("truncated chunked response".into());
         }
         let (chunk, tail) = tail.split_at(size);
-        out.push_str(chunk);
-        rest = tail
-            .strip_prefix("\r\n")
-            .ok_or("malformed chunk terminator")?;
+        out.extend_from_slice(chunk);
+        if tail.len() < 2 || tail[0] != b'\r' || tail[1] != b'\n' {
+            return Err("malformed chunk terminator".into());
+        }
+        rest = &tail[2..];
     }
 }
 
 struct HttpResponse {
     status: u16,
-    body: String,
+    content_type: String,
+    body: Vec<u8>,
 }
 
-fn parse_response(raw: &str) -> Result<HttpResponse, String> {
-    let (head, raw_body) = raw
-        .split_once("\r\n\r\n")
+fn parse_response(raw: &[u8]) -> Result<HttpResponse, String> {
+    let head_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
         .ok_or("malformed HTTP response")?;
+    let head = std::str::from_utf8(&raw[..head_end])
+        .map_err(|_| "malformed HTTP headers".to_owned())?;
     let status = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or("malformed HTTP status line")?;
-    let chunked = head.lines().skip(1).any(|line| {
-        let lower = line.to_ascii_lowercase();
-        lower.starts_with("transfer-encoding:") && lower.contains("chunked")
-    });
+    let mut chunked = false;
+    let mut content_type = String::new();
+    for line in head.lines().skip(1) {
+        let (name, value) = match line.split_once(':') {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            chunked = true;
+        } else if name.eq_ignore_ascii_case("content-type") {
+            content_type = value.trim().to_owned();
+        }
+    }
+    let raw_body = &raw[head_end + 4..];
     let body = if chunked {
         decode_chunked(raw_body)?
     } else {
-        raw_body.to_owned()
+        raw_body.to_vec()
     };
-    Ok(HttpResponse { status, body })
+    Ok(HttpResponse {
+        status,
+        content_type,
+        body,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -325,9 +350,9 @@ impl Runtime {
         stream
             .write_all(request.as_bytes())
             .map_err(|error| format!("HTTP write: {error}"))?;
-        let mut raw = String::new();
+        let mut raw = Vec::new();
         stream
-            .read_to_string(&mut raw)
+            .read_to_end(&mut raw)
             .map_err(|error| format!("HTTP read: {error}"))?;
         parse_response(&raw)
     }
@@ -337,7 +362,7 @@ impl Runtime {
         if response.status >= 400 {
             return Err(http_error(&response));
         }
-        Ok(response.body)
+        String::from_utf8(response.body).map_err(|_| "olgp: response body is not UTF-8".into())
     }
 
     fn json(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
@@ -348,7 +373,8 @@ impl Runtime {
 }
 
 fn http_error(response: &HttpResponse) -> String {
-    let detail: String = response.body.chars().take(200).collect();
+    let detail = String::from_utf8_lossy(&response.body);
+    let detail: String = detail.chars().take(200).collect();
     format!("olgp: HTTP {} {}", response.status, detail)
 }
 
@@ -870,15 +896,28 @@ impl ImageJobs {
     }
 
     pub fn result(&self, job_id: &str) -> Result<Value, String> {
-        let response = self.inner.send(
-            "GET",
-            &format!("/v2/images/jobs/{}/result", path_segment(job_id)),
-            None,
-        )?;
+        let response = self.result_response(job_id)?;
         if response.status >= 400 && response.status != 409 {
             return Err(http_error(&response));
         }
-        parse_json_body(&response.body)
+        let body = String::from_utf8_lossy(&response.body);
+        parse_json_body(&body)
+    }
+
+    pub fn result_bytes(&self, job_id: &str) -> Result<(Vec<u8>, String), String> {
+        let response = self.result_response(job_id)?;
+        if response.status >= 400 {
+            return Err(http_error(&response));
+        }
+        Ok((response.body, response.content_type))
+    }
+
+    fn result_response(&self, job_id: &str) -> Result<HttpResponse, String> {
+        self.inner.send(
+            "GET",
+            &format!("/v2/images/jobs/{}/result", path_segment(job_id)),
+            None,
+        )
     }
 
     pub fn cancel(&self, job_id: &str) -> Result<Value, String> {
@@ -996,26 +1035,37 @@ mod tests {
 
     #[test]
     fn parses_status_and_body() {
-        let raw = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
+        let raw = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}";
         let response = parse_response(raw).unwrap();
         assert_eq!(response.status, 401);
-        assert_eq!(response.body, "{}");
+        assert_eq!(response.body.as_slice(), b"{}");
     }
 
     #[test]
     fn parses_chunked_body() {
-        let raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n";
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n";
         let response = parse_response(raw).unwrap();
         assert_eq!(response.status, 200);
-        assert_eq!(response.body, "{\"a\":1}");
-        assert!(decode_chunked("4\r\nabcd\r\n0\r\n\r\n").unwrap() == "abcd");
+        assert_eq!(response.body.as_slice(), b"{\"a\":1}");
+        assert_eq!(decode_chunked(b"4\r\nabcd\r\n0\r\n\r\n").unwrap().as_slice(), b"abcd");
+    }
+
+    #[test]
+    fn parses_binary_image_response() {
+        let mut raw =
+            b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 6\r\n\r\n".to_vec();
+        raw.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a]);
+        let response = parse_response(&raw).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "image/png");
+        assert_eq!(response.body.as_slice(), b"\x89PNG\r\n".as_slice());
     }
 
     #[test]
     fn rejects_malformed_responses() {
-        assert!(parse_response("not-http").is_err());
-        assert!(parse_response("HTTP/1.1\r\n\r\nbody").is_err());
-        assert!(decode_chunked("zz\r\nbody").is_err());
+        assert!(parse_response(b"not-http").is_err());
+        assert!(parse_response(b"HTTP/1.1\r\n\r\nbody").is_err());
+        assert!(decode_chunked(b"zz\r\nbody").is_err());
     }
 
     #[test]

@@ -416,10 +416,11 @@ impl ProductState {
             if method == "GET" {
                 return Some(match store.result(id) {
                     Ok((bytes, content_type)) => {
-                        let reply = format!(
+                        let mut reply = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
                             bytes.len()
                         ).into_bytes();
+                        reply.extend_from_slice(&bytes);
                         reply
                     }
                     Err(message) => err("result_unavailable", &message, "409 Conflict", false),

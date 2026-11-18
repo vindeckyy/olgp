@@ -246,6 +246,16 @@ class Client:
                         return json.loads(exc.read())
                     raise
 
+            def result_bytes(self, job_id: str) -> tuple[bytes, str]:
+                """Return the raw result body and its Content-Type."""
+                path = f"/v2/images/jobs/{self._id(job_id)}/result"
+                return self._client._raw_request("GET", path)
+
+            def save(self, job_id: str, path: str | os.PathLike[str]) -> None:
+                data, _ = self.result_bytes(job_id)
+                with open(path, "wb") as stream:
+                    stream.write(data)
+
             def cancel(self, job_id: str) -> Any:
                 return self._client._request(
                     "POST", f"/v2/images/jobs/{self._id(job_id)}:cancel"
@@ -326,6 +336,21 @@ class Client:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read())
 
+    def _raw_request(self, method: str, path: str) -> tuple[bytes, str]:
+        request = urllib.request.Request(
+            f"{self.base_url}{path}",
+            headers={"Authorization": f"Bearer {self.token}"},
+            method=method,
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            headers = getattr(response, "headers", {})
+            content_type = (
+                headers.get("Content-Type")
+                or headers.get("content-type")
+                or "application/octet-stream"
+            )
+            return response.read(), content_type
+
     def _post(self, path: str, payload: dict[str, Any]) -> Any:
         return self._request("POST", path, payload)
 
@@ -383,6 +408,9 @@ class _DefaultClient:
         self, method: str, path: str, payload: dict[str, Any] | None = None
     ) -> Any:
         return connect()._request(method, path, payload)
+
+    def _raw_request(self, method: str, path: str) -> tuple[bytes, str]:
+        return connect()._raw_request(method, path)
 
 
 speakers = Client.Speakers(_DefaultClient())

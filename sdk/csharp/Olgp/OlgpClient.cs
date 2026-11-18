@@ -97,11 +97,15 @@ public sealed class OlgpClient
         return Parse(await response.Content.ReadAsStringAsync().ConfigureAwait(false));
     }
 
-    private async Task<byte[]> GetBytesAsync(string path)
+    private async Task<byte[]> GetBytesAsync(string path) =>
+        (await GetBytesWithContentTypeAsync(path).ConfigureAwait(false)).Data;
+
+    private async Task<(byte[] Data, string ContentType)> GetBytesWithContentTypeAsync(string path)
     {
         using var response = await _http.GetAsync(path).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        var data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        return (data, response.Content.Headers.ContentType?.ToString() ?? "application/octet-stream");
     }
 
     private static JsonElement Parse(string content)
@@ -390,6 +394,24 @@ public sealed class OlgpClient
 
             public Task<byte[]> ResultAsync(string jobId) =>
                 client.GetBytesAsync($"/v2/images/jobs/{Uri.EscapeDataString(jobId)}/result");
+
+            public Task<(byte[] Data, string ContentType)> ResultBytesAsync(string jobId) =>
+                client.GetBytesWithContentTypeAsync($"/v2/images/jobs/{Uri.EscapeDataString(jobId)}/result");
+
+            public Task<string> SaveResultAsync((byte[] Data, string ContentType) result, string path) =>
+                SaveBytesAsync(result.Data, path);
+
+            public async Task<string> SaveResultAsync(string jobId, string path)
+            {
+                var (data, _) = await ResultBytesAsync(jobId).ConfigureAwait(false);
+                return await SaveBytesAsync(data, path).ConfigureAwait(false);
+            }
+
+            private static async Task<string> SaveBytesAsync(byte[] data, string path)
+            {
+                await File.WriteAllBytesAsync(path, data).ConfigureAwait(false);
+                return path;
+            }
 
             public Task<JsonElement> CancelAsync(string jobId) =>
                 client.SendAsync(

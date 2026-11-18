@@ -29,6 +29,7 @@ Sources: `https://wici.ai/wici-one`, `https://wici.ai/technology`,
 | Venus | Real Vulkan device in a guest | QEMU command generation and config validation | partial |
 | SDKs | TypeScript and Python documented functions | Four HTTP SDKs plus Rust core; product and engine helpers | implemented |
 | CLI probes | `wici-smi --workload`, `wici runtime check` | `olgp-smi --workload` and `olgpctl runtime check` | implemented |
+| Image results | Verified bytes, `result.save()`, content type | `result_bytes` / `ResultBytesAsync` / typed bytes across SDKs | implemented |
 | Search headers | Caller-owned Tavily provider/key headers | All SDKs support optional `X-Wici-Search-*` headers | implemented |
 | Hardware SKU | RTX 5060 Ti/5090, Wi-Fi 7, NVMe, enclosure, PSU, cooling | Not reproducible in a protocol repo | structural |
 | Driver platforms | macOS, Windows, Vulkan ICD, D3D, games/CAD/video apps | Not implemented; no misleading stub ICD | structural/gap |
@@ -42,7 +43,7 @@ match, but the wire request shape does not.
 
 ## Verified live
 
-- `scripts/check-contract.sh`: `contract ok: 64 routes, 9 TXT keys`.
+- `scripts/check-contract.sh`: `contract ok: 65 routes, 9 TXT keys`.
 - `scripts/run-all.sh`: deterministic checks pass; hardware RTT and CUDA remain explicit skips.
 - Linux GPU box: mDNS discovery, SPAKE2 pairing, credential mode `0600`,
   `doctor`, capabilities with `vram_mib=4096`, TLS listener, and five wrong-code

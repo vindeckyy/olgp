@@ -93,6 +93,16 @@ public final class Client {
         body: [String: Any]? = nil,
         memory: Bool = false
     ) async throws -> Data {
+        let response = try await requestWithContentType(method, path, body: body, memory: memory)
+        return response.data
+    }
+
+    private func requestWithContentType(
+        _ method: String,
+        _ path: String,
+        body: [String: Any]? = nil,
+        memory: Bool = false
+    ) async throws -> (data: Data, contentType: String?) {
         guard let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
             throw OLGPUtilsError.invalidURL
         }
@@ -110,7 +120,7 @@ public final class Client {
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             throw OLGPUtilsError.badResponse
         }
-        return data
+        return (data, http.value(forHTTPHeaderField: "Content-Type"))
     }
 
     private func object(
@@ -371,6 +381,16 @@ public final class Client {
 
     public func imagesJobsResult(_ jobId: String) async throws -> Data {
         try await request("GET", "/v2/images/jobs/\(jobId)/result")
+    }
+
+    public func imageJobResultBytes(_ jobId: String) async throws -> Data {
+        try await request("GET", "/v2/images/jobs/\(jobId)/result")
+    }
+
+    public func imageJobResultBytesWithContentType(
+        _ jobId: String
+    ) async throws -> (data: Data, contentType: String?) {
+        try await requestWithContentType("GET", "/v2/images/jobs/\(jobId)/result")
     }
 
     public func imagesJobsCancel(_ jobId: String) async throws -> [String: Any] {

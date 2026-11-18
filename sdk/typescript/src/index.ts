@@ -38,6 +38,11 @@ export interface ImageJobPollOptions {
   timeoutMs?: number;
 }
 
+export type ImageResultBytes = {
+  data: Uint8Array;
+  contentType: string;
+};
+
 const IMAGE_JOB_TERMINAL_STATES: Record<string, true> = {
   succeeded: true,
   failed: true,
@@ -97,6 +102,31 @@ export class OlgpClient {
       return undefined as T;
     }
     return (await response.json()) as T;
+  }
+
+  private async requestBytes(path: string): Promise<ImageResultBytes> {
+    const response = await fetch(`${this.baseUrl}${path}`, {
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        const body = (await response.json()) as { error?: unknown };
+        detail =
+          typeof body.error === "string"
+            ? body.error
+            : body.error && typeof body.error === "object" && "message" in body.error
+              ? String(body.error.message)
+              : "";
+      } catch {
+        // Non-JSON error bodies still surface as HTTP errors.
+      }
+      throw new Error(`olgp: HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+    }
+    return {
+      data: new Uint8Array(await response.arrayBuffer()),
+      contentType: response.headers.get("content-type") ?? "application/octet-stream",
+    };
   }
 
   private async *imageJobSnapshots(
@@ -231,6 +261,8 @@ export class OlgpClient {
         throw new Error(`olgp: image job ${jobId} produced no state`);
       },
       result: (jobId: string) => this.request("GET", `/v2/images/jobs/${encodeURIComponent(jobId)}/result`),
+      resultBytes: (jobId: string) =>
+        this.requestBytes(`/v2/images/jobs/${encodeURIComponent(jobId)}/result`),
       cancel: (jobId: string, payload?: Json) =>
         this.request("POST", `/v2/images/jobs/${encodeURIComponent(jobId)}:cancel`, payload),
     },
@@ -263,4 +295,16 @@ export class OlgpClient {
 
 export function connect(options: OlgpClientOptions = {}): OlgpClient {
   return new OlgpClient(options);
+}
+
+export async function saveWiciImage(
+  result: ImageResultBytes,
+  path: string,
+): Promise<Uint8Array> {
+  if (typeof process !== "undefined" && process.versions?.node) {
+    // Static import would break browser bundlers where node:fs/promises is absent.
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(path, result.data);
+  }
+  return result.data;
 }
