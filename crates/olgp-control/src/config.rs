@@ -14,6 +14,7 @@ pub struct Config {
     pub rpc_port: u16,
     pub engine_port: u16,
     pub vram_reserve_mib: u32,
+    pub vram_mib: u32,
     pub cache_min_bytes: u64,
     pub max_interactive_sessions: u32,
     pub log_level: String,
@@ -51,12 +52,14 @@ impl Config {
             .map_or(Ok(IpAddr::from([127, 0, 0, 1])), |value| {
                 value.parse::<IpAddr>().map_err(|_| "bad address".to_owned())
             })?;
+        let vram_mib: u32 = get("vram_mib")?.parse().map_err(|_| "bad vram_mib")?;
         Ok(Self {
             box_id,
             api_port: get("api_port")?.parse().map_err(|_| "bad api_port")?,
             rpc_port: get("rpc_port")?.parse().map_err(|_| "bad rpc_port")?,
             engine_port: get("engine_port")?.parse().map_err(|_| "bad engine_port")?,
             vram_reserve_mib: get("vram_reserve_mib")?.parse().map_err(|_| "bad vram_reserve_mib")?,
+            vram_mib,
             cache_min_bytes: get("cache_min_bytes")?.parse().map_err(|_| "bad cache_min_bytes")?,
             max_interactive_sessions: get("max_interactive_sessions")?
                 .parse()
@@ -95,7 +98,7 @@ impl Config {
                 "voice".into(),
             ],
             gpu: self.gpu.clone(),
-            vram_mib: 0,
+            vram_mib: self.vram_mib,
             hostname: self.hostname.clone(),
         })
     }
@@ -122,7 +125,7 @@ mod tests {
     use super::*;
 
     fn config_text() -> &'static str {
-        "box_id = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\napi_port = 8787\nrpc_port = 8843\nengine_port = 8080\nvram_reserve_mib = 512\ncache_min_bytes = 67108864\nmax_interactive_sessions = 1\nlog_level = info\n"
+        "box_id = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\napi_port = 8787\nrpc_port = 8843\nengine_port = 8080\nvram_reserve_mib = 512\nvram_mib = 4096\ncache_min_bytes = 67108864\nmax_interactive_sessions = 1\nlog_level = info\n"
     }
 
     #[test]
@@ -225,6 +228,7 @@ mod tests {
             rpc_port: 8843,
             engine_port: 8080,
             vram_reserve_mib: 512,
+            vram_mib: 4096,
             cache_min_bytes: 64,
             max_interactive_sessions: 1,
             log_level: "info".into(),

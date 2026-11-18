@@ -357,7 +357,7 @@ fn command_setup(args: &[String]) -> Result<(), String> {
     fs::write(dir.join("spki.sha256"), format!("{spki}\n")).map_err(|e| e.to_string())?;
 
     let config = format!(
-        "box_id = {box_id}\napi_port = 8787\nrpc_port = 8843\nengine_port = 8080\nvram_reserve_mib = 512\ncache_min_bytes = 67108864\nmax_interactive_sessions = 1\nlog_level = info\nhostname = olgp-box\ngpu = NVIDIA GPU\n"
+        "box_id = {box_id}\napi_port = 8787\nrpc_port = 8843\nengine_port = 8080\nvram_reserve_mib = 512\nvram_mib = 4096\ncache_min_bytes = 67108864\nmax_interactive_sessions = 1\nlog_level = info\nhostname = olgp-box\ngpu = NVIDIA GPU\n"
     );
     fs::write(dir.join("node.toml"), config).map_err(|e| e.to_string())?;
     println!("setup ok: {}", dir.display());

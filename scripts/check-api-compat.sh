@@ -14,6 +14,7 @@ path.write_text(
     "rpc_port = 18843\n"
     "engine_port = 18080\n"
     "vram_reserve_mib = 512\n"
+    "vram_mib = 4096\n"
     "cache_min_bytes = 67108864\n"
     "max_interactive_sessions = 1\n"
     "log_level = info\n"
