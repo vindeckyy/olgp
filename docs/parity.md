@@ -49,6 +49,7 @@ match, but the wire request shape does not.
 - Linux GPU box: mDNS discovery, SPAKE2 pairing, credential mode `0600`,
   `doctor`, capabilities with `vram_mib=4096`, TLS listener, and five wrong-code
   rejections with no credential written.
+- Live engine session: `POST /engine/sessions` returned a ready session and `GET /engine/sessions` listed it.
 - C++ `olgp_semantic_test` and `olgp_dispatch_test` pass.
 
 ## Remaining structural non-parity
