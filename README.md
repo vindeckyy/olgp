@@ -90,5 +90,6 @@ port `8787`. CUDA/NVML RPC uses TLS on port `8843` and is reverse-proxied to the
 local GPU server.
 
 
+Public-surface parity audit: `docs/parity.md`.
 Spec: `spec/v1/protocol.md`. License: Apache-2.0. Third-party inventory:
 `THIRD_PARTY.md`.

@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 const DEFAULT_BASE_URL: &str = "http://olgp.local:8787";
 const API_PORT: u16 = 8787;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const JOB_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const JOB_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A box found by `olgpctl discover`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -262,7 +264,7 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+    fn send(&self, method: &str, path: &str, body: Option<&str>) -> Result<HttpResponse, String> {
         let request = build_request(method, &self.authority, path, &self.token, body);
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .map_err(|error| format!("connect {}:{}: {error}", self.host, self.port))?;
@@ -276,10 +278,13 @@ impl Runtime {
         stream
             .read_to_string(&mut raw)
             .map_err(|error| format!("HTTP read: {error}"))?;
-        let response = parse_response(&raw)?;
+        parse_response(&raw)
+    }
+
+    fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String, String> {
+        let response = self.send(method, path, body)?;
         if response.status >= 400 {
-            let detail: String = response.body.chars().take(200).collect();
-            return Err(format!("olgp: HTTP {} {}", response.status, detail));
+            return Err(http_error(&response));
         }
         Ok(response.body)
     }
@@ -287,11 +292,20 @@ impl Runtime {
     fn json(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
         let payload = body.map(Value::to_string);
         let text = self.request(method, path, payload.as_deref())?;
-        if text.trim().is_empty() {
-            Ok(Value::Null)
-        } else {
-            serde_json::from_str(&text).map_err(|error| format!("olgp: invalid JSON: {error}"))
-        }
+        parse_json_body(&text)
+    }
+}
+
+fn http_error(response: &HttpResponse) -> String {
+    let detail: String = response.body.chars().take(200).collect();
+    format!("olgp: HTTP {} {}", response.status, detail)
+}
+
+fn parse_json_body(text: &str) -> Result<Value, String> {
+    if text.trim().is_empty() {
+        Ok(Value::Null)
+    } else {
+        serde_json::from_str(text).map_err(|error| format!("olgp: invalid JSON: {error}"))
     }
 }
 
@@ -299,6 +313,7 @@ impl Runtime {
 #[derive(Clone, Debug)]
 pub struct Client {
     pub chat: Chat,
+    pub engine: Engine,
     pub speakers: Speakers,
     pub timers: Timers,
     pub memos: Memos,
@@ -325,6 +340,9 @@ impl Client {
                     inner: inner.clone(),
                 },
             },
+            engine: Engine {
+                inner: inner.clone(),
+            },
             speakers: Speakers {
                 inner: inner.clone(),
             },
@@ -337,7 +355,9 @@ impl Client {
             knowledge_bases: KnowledgeBases {
                 inner: inner.clone(),
             },
-            images: Images { jobs: ImageJobs { inner } },
+            images: Images {
+                jobs: ImageJobs { inner },
+            },
         })
     }
 }
@@ -509,6 +529,25 @@ impl Completions {
 }
 
 #[derive(Clone, Debug)]
+pub struct Engine {
+    inner: Arc<Runtime>,
+}
+
+impl Engine {
+    pub fn status(&self) -> Result<Value, String> {
+        self.inner.json("GET", "/engine/status", None)
+    }
+
+    pub fn capabilities(&self) -> Result<Value, String> {
+        self.inner.json("GET", "/engine/capabilities", None)
+    }
+
+    pub fn sessions(&self) -> Result<Value, String> {
+        self.inner.json("GET", "/engine/sessions", None)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Speakers {
     inner: Arc<Runtime>,
 }
@@ -658,9 +697,45 @@ impl KnowledgeBases {
     }
 }
 
+fn image_job_terminal(job: &Value) -> bool {
+    let status = job
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "succeeded"
+            | "completed"
+            | "complete"
+            | "failed"
+            | "error"
+            | "cancelled"
+            | "canceled"
+            | "model_missing"
+    ) || job.get("phase").and_then(Value::as_str) == Some("done")
+}
+
+fn frame_stream_request<T: Serialize, U: Serialize>(frames: &T, options: &U) -> Value {
+    json!({"frames": frames, "options": options})
+}
+
 #[derive(Clone, Debug)]
 pub struct Images {
     pub jobs: ImageJobs,
+}
+
+impl Images {
+    pub fn stream<T: Serialize, U: Serialize>(
+        &self,
+        frames: &T,
+        options: &U,
+    ) -> Result<Value, String> {
+        let payload = frame_stream_request(frames, options);
+        self.jobs
+            .inner
+            .json("POST", "/v2/images/frames:process", Some(&payload))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -678,12 +753,37 @@ impl ImageJobs {
             .json("GET", &format!("/v2/images/jobs/{}", path_segment(job_id)), None)
     }
 
+    pub fn observe(&self, job_id: &str) -> Result<Value, String> {
+        self.retrieve(job_id)
+    }
+
+    pub fn wait(&self, job_id: &str) -> Result<Value, String> {
+        let deadline = Instant::now() + JOB_WAIT_TIMEOUT;
+        loop {
+            let job = self.retrieve(job_id)?;
+            if image_job_terminal(&job) {
+                return Ok(job);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "olgp: image job {job_id} timed out after {}ms",
+                    JOB_WAIT_TIMEOUT.as_millis()
+                ));
+            }
+            thread::sleep(JOB_POLL_INTERVAL);
+        }
+    }
+
     pub fn result(&self, job_id: &str) -> Result<Value, String> {
-        self.inner.json(
+        let response = self.inner.send(
             "GET",
             &format!("/v2/images/jobs/{}/result", path_segment(job_id)),
             None,
-        )
+        )?;
+        if response.status >= 400 && response.status != 409 {
+            return Err(http_error(&response));
+        }
+        parse_json_body(&response.body)
     }
 
     pub fn cancel(&self, job_id: &str) -> Result<Value, String> {
@@ -859,5 +959,30 @@ mod tests {
     fn rejects_header_injection_and_accepts_client() {
         assert!(Client::new("http://olgp.local:8787", "ok").is_ok());
         assert!(Client::new("http://olgp.local:8787", "bad\r\nX: 1").is_err());
+    }
+
+    #[test]
+    fn recognizes_terminal_image_jobs() {
+        assert!(image_job_terminal(&json!({"status": "succeeded"})));
+        assert!(image_job_terminal(&json!({"status": "MODEL_MISSING"})));
+        assert!(image_job_terminal(&json!({"status": "queued", "phase": "done"})));
+        assert!(!image_job_terminal(&json!({"status": "running", "phase": "generating"})));
+        assert!(!image_job_terminal(&Value::Null));
+    }
+
+    #[test]
+    fn builds_frame_stream_payload() {
+        let frames = vec!["frame-one"];
+        let options = json!({"operation": "detect"});
+        let payload = frame_stream_request(&frames, &options);
+        assert_eq!(payload["frames"][0], "frame-one");
+        assert_eq!(payload["options"]["operation"], "detect");
+    }
+
+    #[test]
+    fn parses_job_error_body() {
+        let body = "{\"error\":{\"code\":\"result_unavailable\"}}";
+        let parsed = parse_json_body(body).unwrap();
+        assert_eq!(parsed["error"]["code"], "result_unavailable");
     }
 }

@@ -61,6 +61,30 @@ fn error(code: &str, message: &str, status: &str, retryable: bool) -> Vec<u8> {
     )
 }
 
+fn api_error(path: &str, code: &str, message: &str, status: &str, retryable: bool) -> Vec<u8> {
+    let core = path.starts_with("/v1/chat/")
+        || path == "/v1/responses"
+        || path == "/v1/models"
+        || path == "/v1/embeddings"
+        || path.starts_with("/v1/audio/")
+        || path.starts_with("/api/");
+    if !core {
+        return error(code, message, status, retryable);
+    }
+    let kind = if status.starts_with("5") { "server_error" } else { "invalid_request_error" };
+    response(
+        status,
+        &json!({"error":{
+            "message":message,
+            "type":kind,
+            "param":Value::Null,
+            "code":code,
+            "retryable":retryable,
+        }})
+        .to_string(),
+    )
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -257,20 +281,21 @@ async fn handle_request(
             let window = state.pairing_window.lock().unwrap();
             let open = window.map_or(false, |deadline| std::time::Instant::now() < deadline);
             let attempts = *state.pairing_attempts.lock().unwrap();
+            let paired = !state.trusted.lock().unwrap().is_empty();
             response(
                 "200 OK",
                 &json!({
                     "box_id": state.info.box_id,
                     "window_open": open,
                     "attempts": attempts,
-                    "paired": false,
+                    "paired": paired,
                 })
                 .to_string(),
             )
         }
         ("POST", "/v1/pairing") => pairing_request(state, body),
         (_, _) if !authorized(head, &state.trusted.lock().unwrap()) => {
-            error("unauthorized", "Device Token required", "401 Unauthorized", false)
+            api_error(path, "unauthorized", "Device Token required", "401 Unauthorized", false)
         }
         ("GET", "/engine/status") => {
             if engine_reachable(state.engine_port).await {
@@ -293,7 +318,8 @@ async fn handle_request(
         | ("POST", "/api/generate") => {
             match proxy_engine(state.engine_port, head, body).await {
                 Some(reply) => reply,
-                None => error(
+                None => api_error(
+                    path,
                     "upstream_unavailable",
                     "engine is not ready",
                     "502 Bad Gateway",
@@ -303,7 +329,8 @@ async fn handle_request(
         }
         ("GET", "/v1/models") => match proxy_engine(state.engine_port, head, body).await {
             Some(reply) => reply,
-            None => error(
+            None => api_error(
+                path,
                 "upstream_unavailable",
                 "engine is not ready",
                 "502 Bad Gateway",
@@ -590,6 +617,10 @@ mod tests {
     #[tokio::test]
     async fn protected_route_requires_token() {
         let reply = handle_request("GET", "/v1/models", "", "", &state()).await;
-        assert!(String::from_utf8_lossy(&reply).contains("401 Unauthorized"));
+        let body = String::from_utf8_lossy(&reply);
+        assert!(body.contains("401 Unauthorized"));
+        assert!(body.contains("\"type\":\"invalid_request_error\""));
+        assert!(body.contains("\"param\":null"));
+        assert!(body.contains("\"retryable\":false"));
     }
 }

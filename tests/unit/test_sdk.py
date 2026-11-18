@@ -133,5 +133,30 @@ class SdkTest(unittest.TestCase):
             )
         )
 
+
+    def test_engine_and_image_lifecycle_helpers(self) -> None:
+        client = olgp.Client("http://box:8787", "token")
+        job = {"id": "img-1", "status": "succeeded"}
+        responses = [
+            FakeResponse(json.dumps({"ok": True}).encode())
+            for _ in range(4)
+        ] + [FakeResponse(json.dumps(job).encode()) for _ in range(5)]
+        with mock.patch.object(
+            olgp.urllib.request, "urlopen", side_effect=responses
+        ) as open_mock:
+            self.assertEqual(client.engine.status(), {"ok": True})
+            self.assertEqual(client.engine.capabilities(), {"ok": True})
+            self.assertEqual(client.engine.sessions(), {"ok": True})
+            self.assertEqual(client.images.frames_process(image="AA"), {"ok": True})
+            self.assertEqual(client.images.jobs.retrieve("img-1"), job)
+            self.assertEqual(client.images.jobs.observe("img-1"), job)
+            self.assertEqual(client.images.jobs.wait("img-1", timeout=1, interval=0), job)
+            self.assertEqual(client.images.jobs.result("img-1"), job)
+            self.assertEqual(client.images.jobs.cancel("img-1"), job)
+        paths = [call.args[0].full_url for call in open_mock.call_args_list]
+        self.assertTrue(any(path.endswith("/engine/status") for path in paths))
+        self.assertTrue(any(path.endswith("/v2/images/frames:process") for path in paths))
+        self.assertTrue(any(path.endswith("/v2/images/jobs/img-1:cancel") for path in paths))
+
 if __name__ == "__main__":
     unittest.main()

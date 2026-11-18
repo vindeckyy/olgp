@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Runtime.CompilerServices;
 
 namespace Olgp;
 
@@ -35,6 +36,7 @@ public sealed class OlgpClient
         KnowledgeBases = new KnowledgeBaseRoutes(this);
         Images = new ImageRoutes(this);
         AudioRecordings = new RecordingRoutes(this);
+        Engine = new EngineRoutes(this);
     }
 
     public SpeakerRoutes Speakers { get; }
@@ -45,6 +47,7 @@ public sealed class OlgpClient
     public KnowledgeBaseRoutes KnowledgeBases { get; }
     public ImageRoutes Images { get; }
     public RecordingRoutes AudioRecordings { get; }
+    public EngineRoutes Engine { get; }
 
     public async Task<string> ChatAsync(string model, IEnumerable<ChatMessage> messages)
     {
@@ -306,6 +309,8 @@ public sealed class OlgpClient
 
     public sealed class ImageRoutes(OlgpClient client)
     {
+        public JobRoutes Jobs { get; } = new(client);
+
         public Task<JsonElement> CreateAsync(object? request = null) =>
             client.SendAsync(
                 HttpMethod.Post,
@@ -327,6 +332,128 @@ public sealed class OlgpClient
                 HttpMethod.Post,
                 $"/v2/images/jobs/{Uri.EscapeDataString(jobId)}:cancel"
             );
+
+        public async IAsyncEnumerable<JsonElement> StreamAsync<T>(
+            IEnumerable<T> frames,
+            object? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            foreach (var frame in frames)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return await ProcessFrameAsync(frame, options).ConfigureAwait(false);
+            }
+        }
+
+        public async IAsyncEnumerable<JsonElement> StreamAsync<T>(
+            IAsyncEnumerable<T> frames,
+            object? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await foreach (var frame in frames
+                .WithCancellation(cancellationToken)
+                .ConfigureAwait(false))
+            {
+                yield return await ProcessFrameAsync(frame, options).ConfigureAwait(false);
+            }
+        }
+
+        private Task<JsonElement> ProcessFrameAsync(object frame, object? options) =>
+            client.SendAsync(HttpMethod.Post, "/v2/images/frames:process", new { frame, options });
+
+        public sealed class JobRoutes(OlgpClient client)
+        {
+            public Task<JsonElement> CreateAsync(object? request = null) =>
+                client.SendAsync(HttpMethod.Post, "/v2/images/jobs", request ?? new { operation = "generate" });
+
+            public Task<JsonElement> RetrieveAsync(string jobId) =>
+                client.SendAsync(
+                    HttpMethod.Get,
+                    $"/v2/images/jobs/{Uri.EscapeDataString(jobId)}"
+                );
+
+            public Task<byte[]> ResultAsync(string jobId) =>
+                client.GetBytesAsync($"/v2/images/jobs/{Uri.EscapeDataString(jobId)}/result");
+
+            public Task<JsonElement> CancelAsync(string jobId) =>
+                client.SendAsync(
+                    HttpMethod.Post,
+                    $"/v2/images/jobs/{Uri.EscapeDataString(jobId)}:cancel"
+                );
+
+            public async IAsyncEnumerable<JsonElement> ObserveAsync(
+                string jobId,
+                int intervalMs = 500,
+                [EnumeratorCancellation] CancellationToken cancellationToken = default)
+            {
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var state = await RetrieveAsync(jobId).ConfigureAwait(false);
+                    yield return state;
+                    if (IsTerminal(state))
+                    {
+                        yield break;
+                    }
+                    await Task.Delay(intervalMs, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            public async Task<JsonElement> WaitAsync(
+                string jobId,
+                int intervalMs = 500,
+                int timeoutMs = 600_000,
+                CancellationToken cancellationToken = default)
+            {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(timeoutMs);
+                JsonElement state = default;
+                try
+                {
+                    await foreach (var update in ObserveAsync(jobId, intervalMs, timeout.Token)
+                        .WithCancellation(timeout.Token)
+                        .ConfigureAwait(false))
+                    {
+                        state = update;
+                    }
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException($"timed out waiting for image job {jobId}");
+                }
+                var status = Status(state);
+                if (status != "succeeded")
+                {
+                    throw new InvalidOperationException(
+                        $"image job {jobId} ended with status {status ?? "unknown"}");
+                }
+                return state;
+            }
+
+            private static string? Status(JsonElement state) =>
+                state.ValueKind == JsonValueKind.Object
+                && state.TryGetProperty("status", out var value)
+                && value.ValueKind == JsonValueKind.String
+                    ? value.GetString()
+                    : null;
+
+            private static bool IsTerminal(JsonElement state) =>
+                Status(state) is "succeeded" or "failed" or "cancelled"
+                    or "model_missing" or "deployment_unavailable"
+                    or "gpu_lifecycle_unavailable" or "error";
+        }
+    }
+
+    public sealed class EngineRoutes(OlgpClient client)
+    {
+        public Task<JsonElement> StatusAsync() =>
+            client.SendAsync(HttpMethod.Get, "/engine/status");
+
+        public Task<JsonElement> CapabilitiesAsync() =>
+            client.SendAsync(HttpMethod.Get, "/engine/capabilities");
+
+        public Task<JsonElement> SessionsAsync() =>
+            client.SendAsync(HttpMethod.Get, "/engine/sessions");
     }
 
     public sealed class RecordingRoutes(OlgpClient client)

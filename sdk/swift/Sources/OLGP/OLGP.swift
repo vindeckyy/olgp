@@ -28,10 +28,12 @@ struct ChatCompletionResponse: Codable {
 public enum OLGPUtilsError: Error {
     case invalidURL
     case badResponse
+    case jobTimeout
 }
 
 public final class Client {
     private let baseURL: URL
+    private let token: String
     private let memoryToken: String
 
     public init(baseURL: String? = nil, token: String? = nil, memoryToken: String? = nil) throws {
@@ -312,6 +314,20 @@ public final class Client {
         )
     }
 
+    // MARK: - Engine
+
+    public func engineStatus() async throws -> [String: Any] {
+        try await object("GET", "/engine/status")
+    }
+
+    public func engineCapabilities() async throws -> [String: Any] {
+        try await object("GET", "/engine/capabilities")
+    }
+
+    public func engineSessions() async throws -> [String: Any] {
+        try await object("GET", "/engine/sessions")
+    }
+
     // MARK: - Image jobs
 
     public func imagesJobsCreate(
@@ -333,6 +349,52 @@ public final class Client {
 
     public func imagesJobsCancel(_ jobId: String) async throws -> [String: Any] {
         try await object("POST", "/v2/images/jobs/\(jobId):cancel")
+    }
+
+    public func imagesFramesProcess(
+        frames: [String],
+        options: [String: Any] = [:]
+    ) async throws -> [String: Any] {
+        var body = options
+        body["frames"] = frames
+        return try await object("POST", "/v2/images/frames:process", body: body)
+    }
+
+    public func imagesStream(
+        frames: [String],
+        options: [String: Any] = [:]
+    ) async throws -> [String: Any] {
+        try await imagesFramesProcess(frames: frames, options: options)
+    }
+
+    // shortcut: polls the job route; the contract has no job-events subscription.
+    public func imagesJobsObserve(
+        _ jobId: String,
+        intervalMs: UInt64 = 250,
+        timeoutMs: UInt64 = 60_000
+    ) async throws -> [String: Any] {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1_000)
+        while true {
+            let job = try await imagesJobsRetrieve(jobId)
+            let status = (job["status"] as? String)?.lowercased() ?? ""
+            if ["succeeded", "failed", "canceled", "cancelled", "model_missing"].contains(status) {
+                return job
+            }
+            guard Date() < deadline else { throw OLGPUtilsError.jobTimeout }
+            try await Task.sleep(nanoseconds: intervalMs * 1_000_000)
+        }
+    }
+
+    public func imagesJobsWait(
+        _ jobId: String,
+        intervalMs: UInt64 = 250,
+        timeoutMs: UInt64 = 60_000
+    ) async throws -> Data {
+        let job = try await imagesJobsObserve(jobId, intervalMs: intervalMs, timeoutMs: timeoutMs)
+        guard (job["status"] as? String)?.lowercased() == "succeeded" else {
+            throw OLGPUtilsError.badResponse
+        }
+        return try await imagesJobsResult(jobId)
     }
 
     // MARK: - Recordings

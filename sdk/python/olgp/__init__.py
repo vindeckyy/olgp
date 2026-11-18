@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import urllib.request
+from urllib.error import HTTPError
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -20,6 +22,7 @@ __all__ = [
     "connect",
     "discover",
     "pair",
+    "engine",
     "speakers",
     "timers",
     "memos",
@@ -174,15 +177,64 @@ class Client:
                 {"query": question, "topK": top_k},
             )
 
+    class Engine(_Module):
+        def status(self) -> Any:
+            return self._client._request("GET", "/engine/status")
+
+        def capabilities(self) -> Any:
+            return self._client._request("GET", "/engine/capabilities")
+
+        def sessions(self) -> Any:
+            return self._client._request("GET", "/engine/sessions")
+
     class Images(_Module):
+        def frames_process(self, **fields: Any) -> Any:
+            return self._client._request("POST", "/v2/images/frames:process", fields)
+
         class Jobs(_Module):
+            _TERMINAL = frozenset(
+                {
+                    "succeeded",
+                    "completed",
+                    "complete",
+                    "failed",
+                    "error",
+                    "cancelled",
+                    "canceled",
+                    "model_missing",
+                }
+            )
+
             def create(self, **fields: Any) -> Any:
                 return self._client._request("POST", "/v2/images/jobs", fields)
 
+            def retrieve(self, job_id: str) -> Any:
+                return self._client._request("GET", f"/v2/images/jobs/{self._id(job_id)}")
+
+            def observe(self, job_id: str) -> Any:
+                return self.retrieve(job_id)
+
+            def wait(
+                self, job_id: str, *, timeout: float = 60.0, interval: float = 0.25
+            ) -> Any:
+                deadline = time.monotonic() + timeout
+                while True:
+                    job = self.retrieve(job_id)
+                    if str(job.get("status", "")).lower() in self._TERMINAL:
+                        return job
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"image job {job_id} did not finish in {timeout}s")
+                    time.sleep(min(interval, remaining))
+
             def result(self, job_id: str) -> Any:
-                return self._client._request(
-                    "GET", f"/v2/images/jobs/{self._id(job_id)}/result"
-                )
+                path = f"/v2/images/jobs/{self._id(job_id)}/result"
+                try:
+                    return self._client._request("GET", path)
+                except HTTPError as exc:
+                    if exc.code == 409:
+                        return json.loads(exc.read())
+                    raise
 
             def cancel(self, job_id: str) -> Any:
                 return self._client._request(
@@ -279,6 +331,10 @@ class Client:
         return self.KnowledgeBases(self)
 
     @property
+    def engine(self) -> "Client.Engine":
+        return self.Engine(self)
+
+    @property
     def images(self) -> "Client.Images":
         return self.Images(self)
 
@@ -313,6 +369,7 @@ phones = Client.Phones(_DefaultClient())
 audio_memory = Client.AudioMemory(_DefaultClient())
 knowledge_bases = Client.KnowledgeBases(_DefaultClient())
 images = Client.Images(_DefaultClient())
+engine = Client.Engine(_DefaultClient())
 recordings = Client.Recordings(_DefaultClient())
 
 

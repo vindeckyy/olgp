@@ -39,6 +39,12 @@ impl TrustedClients {
         Ok(Self { path: path.to_owned(), clients })
     }
 
+
+    /// Whether any client has been paired.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
     /// Check a bearer token.
     #[must_use]
     pub fn is_valid(&self, token: &str) -> bool {
@@ -104,8 +110,10 @@ mod tests {
         let _ = fs::remove_file(&path);
         let mut store = TrustedClients::load(&path).unwrap();
         assert!(!store.is_valid("token"));
+        assert!(store.is_empty());
         store.add(&credential("token")).unwrap();
         assert!(store.is_valid("token"));
+        assert!(!store.is_empty());
         assert!(store.revoke("token").unwrap());
         assert!(!store.is_valid("token"));
         fs::remove_file(path).unwrap();

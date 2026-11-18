@@ -18,6 +18,22 @@ export interface OlgpClientOptions {
   memoryToken?: string;
 }
 
+export interface ImageJobPollOptions {
+  intervalMs?: number;
+  timeoutMs?: number;
+}
+
+const IMAGE_JOB_TERMINAL_STATES: Record<string, true> = {
+  succeeded: true,
+  failed: true,
+  cancelled: true,
+  model_missing: true,
+};
+const IMAGE_JOB_FAILED_STATES: Record<string, true> = {
+  failed: true,
+  model_missing: true,
+};
+
 export class OlgpClient {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -56,6 +72,31 @@ export class OlgpClient {
       return undefined as T;
     }
     return (await response.json()) as T;
+  }
+
+  private async *imageJobSnapshots(
+    jobId: string,
+    options: ImageJobPollOptions = {},
+  ): AsyncGenerator<Json> {
+    const intervalMs = options.intervalMs ?? 250;
+    const timeoutMs = options.timeoutMs;
+    const deadlineMs = timeoutMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
+    for (;;) {
+      const job = (await this.request(
+        "GET",
+        `/v2/images/jobs/${encodeURIComponent(jobId)}`,
+      )) as Json;
+      yield job;
+      if (typeof job.status === "string" && IMAGE_JOB_TERMINAL_STATES[job.status] === true) {
+        return;
+      }
+      if (Date.now() >= deadlineMs) {
+        throw new Error(`olgp: image job ${jobId} timed out after ${timeoutMs}ms`);
+      }
+      const delay = Promise.withResolvers<void>();
+      setTimeout(delay.resolve, intervalMs);
+      await delay.promise;
+    }
   }
 
   readonly speakers = {
@@ -134,14 +175,35 @@ export class OlgpClient {
       this.request("POST", `/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}:query`, payload),
   };
 
+  readonly engine = {
+    status: () => this.request("GET", "/engine/status"),
+    capabilities: () => this.request("GET", "/engine/capabilities"),
+    sessions: () => this.request("GET", "/engine/sessions"),
+  };
+
   readonly images = {
     jobs: {
       create: (payload: Json) => this.request("POST", "/v2/images/jobs", payload),
       retrieve: (jobId: string) => this.request("GET", `/v2/images/jobs/${encodeURIComponent(jobId)}`),
+      observe: (jobId: string, options: ImageJobPollOptions = {}) =>
+        this.imageJobSnapshots(jobId, options),
+      wait: async (jobId: string, options: ImageJobPollOptions = {}) => {
+        for await (const job of this.imageJobSnapshots(jobId, options)) {
+          const status = job.status;
+          if (typeof status === "string" && IMAGE_JOB_FAILED_STATES[status] === true) {
+            throw new Error(`olgp: image job ${jobId} ${status}`);
+          }
+          if (typeof status === "string" && IMAGE_JOB_TERMINAL_STATES[status] === true) {
+            return job;
+          }
+        }
+        throw new Error(`olgp: image job ${jobId} produced no state`);
+      },
       result: (jobId: string) => this.request("GET", `/v2/images/jobs/${encodeURIComponent(jobId)}/result`),
       cancel: (jobId: string, payload?: Json) =>
         this.request("POST", `/v2/images/jobs/${encodeURIComponent(jobId)}:cancel`, payload),
     },
+    framesProcess: (payload: Json) => this.request("POST", "/v2/images/frames:process", payload),
   };
 
   readonly recordings = {

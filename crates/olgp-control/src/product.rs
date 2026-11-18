@@ -217,13 +217,29 @@ impl ProductState {
         let mut store = self.memory.lock().unwrap();
         match (method, path) {
             ("GET", "/v1/audio-memory/status") => Some(ok(json!({
-                "capture": {"enabled": store.settings().mode == "active"},
-                "readiness": {"query": store.ready()},
-                "retention_days": store.settings().retention_days,
+                "ok": true,
+                "enabled": store.settings().mode == "active",
+                "paused": store.settings().mode == "paused",
+                "mode": store.settings().mode,
+                "rawAudioRetention": "none",
+                "longTermRetention": "until_forgotten",
+                "counts": {
+                    "observations": store.episodes().len(),
+                    "episodes": store.episodes().len(),
+                    "notes": store.notes().len(),
+                },
             }))),
             ("GET", "/v1/audio-memory/health/ready") => {
-                if store.ready() {
-                    Some(ok(json!({"ready":true,"dependencies":{}})))
+                let mode = store.settings().mode.as_str();
+                if store.ready() && mode != "paused" {
+                    Some(ok(json!({
+                        "ok": true,
+                        "service": "audio-memory",
+                        "ingestReady": true,
+                        "captureReady": mode == "active",
+                        "retrievalReady": true,
+                        "answerReady": true,
+                    })))
                 } else {
                     Some(err("not_ready", "audio memory unavailable", "503 Service Unavailable", true))
                 }
