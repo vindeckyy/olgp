@@ -154,6 +154,10 @@ async fn proxy_engine(port: u16, head: &str, body: &str) -> Option<Vec<u8>> {
     Some(reply)
 }
 
+async fn engine_reachable(port: u16) -> bool {
+    TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port))).await.is_ok()
+}
+
 async fn api_connection(mut socket: TcpStream, state: Arc<GatewayState>) {
     let Some((head, body, first)) = read_request(&mut socket).await else {
         return;
@@ -204,6 +208,10 @@ async fn handle_request(
         ("GET", "/v1/capabilities") => response(
             "200 OK",
             &json!({
+                "service": "olgp-edge",
+                "apiVersion": 1,
+                "responses": {"text": true},
+                "ready": {"llm": true, "qna": true, "voice": true},
                 "box_id": state.info.box_id,
                 "gpu": state.info.gpu,
                 "vram_mib": state.info.vram_mib,
@@ -217,6 +225,7 @@ async fn handle_request(
                     "recordings": true,
                     "images": true,
                 },
+                "realtime": {"voice": true, "chat": true},
                 "scheduler": {
                     "vram_bytes": state.scheduler.lock().unwrap().counters.vram_bytes,
                     "sessions": state.scheduler.lock().unwrap().session_count(),
@@ -226,8 +235,17 @@ async fn handle_request(
                     "kv_sessions": state.registry.lock().unwrap().tenant_count(),
                 },
                 "search": {"policy": "caller-key"},
+                "images": {
+                    "contractVersion": 3,
+                    "operations": {
+                        "generate": {"ready": false},
+                        "edit": {"ready": false},
+                        "face_swap": {"ready": false},
+                        "reframe": {"ready": false},
+                        "detect": {"ready": false},
+                    },
+                },
                 "memory": {"policy": "opt-in"},
-                "ready": true,
             })
             .to_string(),
         ),
@@ -254,6 +272,18 @@ async fn handle_request(
         (_, _) if !authorized(head, &state.trusted.lock().unwrap()) => {
             error("unauthorized", "Device Token required", "401 Unauthorized", false)
         }
+        ("GET", "/engine/status") => {
+            if engine_reachable(state.engine_port).await {
+                response("200 OK", &json!({"service":"olgp-engine","ready":true}).to_string())
+            } else {
+                error("not_ready", "engine is not ready", "503 Service Unavailable", true)
+            }
+        }
+        ("GET", "/engine/capabilities") => response(
+            "200 OK",
+            &json!({"service":"olgp-engine","apiVersion":1,"sessions":true}).to_string(),
+        ),
+        ("GET", "/engine/sessions") => response("200 OK", "{\"sessions\":[]}\n"),
         ("POST", "/v1/chat/completions")
         | ("POST", "/v1/responses")
         | ("POST", "/v1/embeddings")

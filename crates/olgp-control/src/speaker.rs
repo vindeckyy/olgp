@@ -16,13 +16,23 @@ pub struct Bluetooth {
     pub stream_state: String,
 }
 
-/// A first-party speaker and its current playback task.
+fn default_state() -> String { "idle".into() }
+
+fn default_volume_limit() -> u8 { 100 }
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Speaker {
+    #[serde(alias = "device_id")]
     pub device_id: String,
     pub name: String,
     pub online: bool,
     pub volume: u8,
+    #[serde(default = "default_state")]
+    pub state: String,
+    #[serde(default = "default_volume_limit")]
+    pub volume_limit: u8,
+    #[serde(alias = "active_task")]
     pub active_task: Option<String>,
     pub capabilities: Vec<String>,
     pub bluetooth: Bluetooth,
@@ -41,6 +51,8 @@ impl Default for Persisted {
                 name: "OLGP Speaker".into(),
                 online: true,
                 volume: 50,
+                state: "idle".into(),
+                volume_limit: 100,
                 active_task: None,
                 capabilities: vec![
                     "play".into(),
@@ -124,6 +136,7 @@ impl SpeakerStore {
         let updated = {
             let speaker = self.speaker_mut(id)?;
             speaker.active_task = Some(url.to_owned());
+            speaker.state = "speaking".into();
             speaker.clone()
         };
         self.persist()?;
@@ -139,6 +152,7 @@ impl SpeakerStore {
         let updated = {
             let speaker = self.speaker_mut(id)?;
             speaker.active_task = None;
+            speaker.state = "idle".into();
             speaker.clone()
         };
         self.persist()?;

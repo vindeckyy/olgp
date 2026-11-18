@@ -1,6 +1,6 @@
 # v1/v2 route contract
 
-Sixty public routes are defined in v1 and the preview v2 image-job namespace.
+Sixty-four public routes are defined in v1, v2, and the local engine namespace.
 `scripts/check-contract.sh` verifies that this list matches
 `crates/olgp-control/src/api.rs`.
 
@@ -66,6 +66,10 @@ Sixty public routes are defined in v1 and the preview v2 image-job namespace.
 | GET | `/v2/images/jobs/{jobId}` | Device Token |
 | GET | `/v2/images/jobs/{jobId}/result` | Device Token |
 | POST | `/v2/images/jobs/{jobId}:cancel` | Device Token |
+| POST | `/v2/images/frames:process` | Device Token |
+| GET | `/engine/status` | Device Token |
+| GET | `/engine/capabilities` | Device Token |
+| GET | `/engine/sessions` | Device Token |
 
 Voice events: `ready`, `text_input`, `commit`, `cancel`, `reset`,
 `input_committed`, `stt_partial`, `stt_final`, `text_tentative`, `text`, `end`,

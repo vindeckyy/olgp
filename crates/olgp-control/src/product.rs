@@ -372,14 +372,28 @@ impl ProductState {
 
     fn image_handle(&self, method: &str, path: &str, request: Option<&Value>) -> Option<Vec<u8>> {
         let mut store = self.images.lock().unwrap();
+        if (method, path) == ("POST", "/v2/images/frames:process") {
+            return Some(err(
+                "model_missing",
+                "image frame worker is not provisioned",
+                "503 Service Unavailable",
+                true,
+            ));
+        }
         if (method, path) == ("POST", "/v2/images/jobs") {
             let operation = field(request, "operation").unwrap_or_else(|| "generate".into());
             let payload = request.unwrap_or(&Value::Null).to_string();
-            return Some(mutation(store.create(&operation, &payload)));
+            return Some(match store.create(&operation, &payload) {
+                Ok(job) => reply("202 Accepted", &json!(job).to_string()),
+                Err(message) => err("invalid_request", &message, "400 Bad Request", false),
+            });
         }
         if let Some(id) = bounded(path, "/v2/images/jobs/", ":cancel") {
             if method == "POST" {
-                return Some(mutation(store.cancel(id).map(|job| json!({"job":job}))));
+                return Some(match store.cancel(id) {
+                    Ok(job) => reply("202 Accepted", &json!({"job":job}).to_string()),
+                    Err(message) => err("invalid_request", &message, "400 Bad Request", false),
+                });
             }
         }
         if let Some(id) = bounded(path, "/v2/images/jobs/", "/result") {
@@ -485,7 +499,11 @@ mod tests {
 
     fn id_of(reply: &[u8]) -> String {
         let value: Value = serde_json::from_str(&body_of(reply)).unwrap();
-        value["result"]["id"].as_str().unwrap().to_owned()
+        value["id"]
+            .as_str()
+            .or_else(|| value["result"]["id"].as_str())
+            .unwrap()
+            .to_owned()
     }
 
     fn status_of(reply: &[u8]) -> &str {
@@ -548,10 +566,11 @@ mod tests {
         assert_eq!(status_of(&state.handle("GET", &format!("/v1/audio/recordings/{recording}"), auth, "").unwrap()), "200");
         assert_eq!(status_of(&state.handle("DELETE", &format!("/v1/audio/recordings/{recording}"), auth, "").unwrap()), "200");
 
+        assert_eq!(status_of(&state.handle("POST", "/v2/images/frames:process", auth, "{}").unwrap()), "503");
         let job = id_of(&state.handle("POST", "/v2/images/jobs", auth, "{\"operation\":\"generate\"}").unwrap());
         assert_eq!(status_of(&state.handle("GET", &format!("/v2/images/jobs/{job}"), auth, "").unwrap()), "200");
         assert_eq!(status_of(&state.handle("GET", &format!("/v2/images/jobs/{job}/result"), auth, "").unwrap()), "409");
-        assert_eq!(status_of(&state.handle("POST", &format!("/v2/images/jobs/{job}:cancel"), auth, "").unwrap()), "200");
+        assert_eq!(status_of(&state.handle("POST", &format!("/v2/images/jobs/{job}:cancel"), auth, "").unwrap()), "202");
 
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -9,8 +9,8 @@ pub struct Route {
     pub path: &'static str,
 }
 
-/// All 60 public routes.
-pub const ROUTES: [Route; 60] = [
+/// All 64 public routes.
+pub const ROUTES: [Route; 64] = [
     Route { method: "GET", path: "/v1/health/live" },
     Route { method: "GET", path: "/v1/capabilities" },
     Route { method: "GET", path: "/v1/pairing/status" },
@@ -71,6 +71,10 @@ pub const ROUTES: [Route; 60] = [
     Route { method: "GET", path: "/v2/images/jobs/{jobId}" },
     Route { method: "GET", path: "/v2/images/jobs/{jobId}/result" },
     Route { method: "POST", path: "/v2/images/jobs/{jobId}:cancel" },
+    Route { method: "POST", path: "/v2/images/frames:process" },
+    Route { method: "GET", path: "/engine/status" },
+    Route { method: "GET", path: "/engine/capabilities" },
+    Route { method: "GET", path: "/engine/sessions" },
 ];
 
 /// Return the route registry.
@@ -84,8 +88,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_count_is_sixty() {
-        assert_eq!(routes().len(), 60);
+    fn route_count_is_sixty_four() {
+        assert_eq!(routes().len(), 64);
     }
 
     #[test]
