@@ -19,6 +19,8 @@ shim path remains separate.
 - `engine/olgp-engine/` — loopback model supervisor.
 - `sdk/python/`, `sdk/typescript/` — thin HTTP clients.
 - `third_party/` — pinned Apache-2.0/MIT OR Apache-2.0 dependencies.
+- `sdk/swift/` — Swift HTTP client.
+- `sdk/python/olgp/torch_support.py` — `olgp.gpu(...)` device-like helper.
 
 ## Quickstart
 
@@ -81,6 +83,9 @@ The box exposes `GET /v1/health/live`, `GET /v1/capabilities`, `GET /metrics`,
 pairing routes, and Device-Token-protected OpenAI/Ollama-compatible routes on
 port `8787`. CUDA/NVML RPC uses TLS on port `8843` and is reverse-proxied to the
 local GPU server.
+
+Device-Token-protected household state is available at `GET/POST /v1/timers`
+and `GET/POST /v1/memos`, backed by `/var/lib/olgp/household.json` by default.
 
 Spec: `spec/v1/protocol.md`. License: Apache-2.0. Third-party inventory:
 `THIRD_PARTY.md`.

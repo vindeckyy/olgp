@@ -39,6 +39,10 @@
     "status": "passed",
     "detail": "log:/tmp/olgp-kernel.log"
   },
+  "bench_models": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-bench_models.log"
+  },
   "rtt": {
     "status": "skipped",
     "detail": "hardware run not requested; set OLGP_E2E=1 on the paired machines"

@@ -17,11 +17,13 @@ use crate::config::Config;
 use tokio::io::copy_bidirectional;
 use crate::discovery::BoxInfo;
 use crate::pairing::HostPairing;
+use crate::household::{Household, Memo, Timer};
 
 struct GatewayState {
     info: BoxInfo,
     identity: DeviceIdentity,
     pairing: Mutex<Option<HostPairing>>,
+    household: Mutex<Household>,
     engine_port: u16,
 }
 
@@ -207,6 +209,13 @@ async fn handle_request(
                 true,
             ),
         },
+        ("GET", "/v1/timers") | ("POST", "/v1/timers") | ("GET", "/v1/memos") | ("POST", "/v1/memos") => {
+            if authorized(head) {
+                household_request(method, path, body, state)
+            } else {
+                error("unauthorized", "Device Token required", "401 Unauthorized", false)
+            }
+        }
         _ => error("invalid_request", "unknown route", "404 Not Found", false),
     }
 }
@@ -295,6 +304,54 @@ fn pairing_request(state: &GatewayState, body: &str) -> Vec<u8> {
     }
 }
 
+
+fn household_request(method: &str, path: &str, body: &str, state: &GatewayState) -> Vec<u8> {
+    let request: Option<Value> = serde_json::from_str(body).ok();
+    let mut store = state.household.lock().unwrap();
+    match (method, path) {
+        ("GET", "/v1/timers") => response("200 OK", &json!(store.timers()).to_string()),
+        ("POST", "/v1/timers") => {
+            let Some(request) = request else {
+                return error("invalid_request", "bad JSON", "400 Bad Request", false);
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let timer = Timer {
+                id: format!("t{now}"),
+                kind: request.get("kind").and_then(Value::as_str).unwrap_or("timer").to_owned(),
+                due_at_ms: request.get("dueAtMs").and_then(Value::as_u64).unwrap_or(0),
+                title: request.get("title").and_then(Value::as_str).unwrap_or("").to_owned(),
+                cancelled: false,
+            };
+            match store.add_timer(timer.clone()) {
+                Ok(()) => response("200 OK", &json!(timer).to_string()),
+                Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
+            }
+        }
+        ("GET", "/v1/memos") => response("200 OK", &json!(store.memos()).to_string()),
+        ("POST", "/v1/memos") => {
+            let Some(request) = request else {
+                return error("invalid_request", "bad JSON", "400 Bad Request", false);
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let memo = Memo {
+                id: format!("m{now}"),
+                title: request.get("title").and_then(Value::as_str).unwrap_or("").to_owned(),
+                dismissed: false,
+            };
+            match store.add_memo(memo.clone()) {
+                Ok(()) => response("200 OK", &json!(memo).to_string()),
+                Err(message) => error("internal_error", &message, "500 Internal Server Error", false),
+            }
+        }
+        _ => error("invalid_request", "unknown route", "404 Not Found", false),
+    }
+}
 fn tls_acceptor(config: &Config) -> Result<TlsAcceptor, String> {
     let mut cert_reader = BufReader::new(
         File::open(config.cert_path()).map_err(|e| format!("cert read: {e}"))?,
@@ -337,10 +394,16 @@ pub async fn run(config: Config, info: BoxInfo) -> Result<(), String> {
         .await
         .map_err(|e| format!("rpc bind: {e}"))?;
     let acceptor = tls_acceptor(&config)?;
+    let household_path = std::path::PathBuf::from(
+        std::env::var("OLGP_HOUSEHOLD_PATH")
+            .unwrap_or_else(|_| "/var/lib/olgp/household.json".into()),
+    );
+    let household = Household::load(&household_path)?;
     let state = Arc::new(GatewayState {
         info,
         identity: DeviceIdentity::generate().map_err(|e| e.to_string())?,
         pairing: Mutex::new(None),
+        household: Mutex::new(household),
         engine_port: config.engine_port,
     });
     let upstream = SocketAddr::from(([127, 0, 0, 1], 14833));
@@ -392,6 +455,10 @@ mod tests {
             identity: DeviceIdentity::generate().unwrap(),
             pairing: Mutex::new(None),
             engine_port: 18080,
+            household: Mutex::new(
+                Household::load(&std::path::PathBuf::from("/tmp/olgp-gateway-test-household.json"))
+                    .unwrap(),
+            ),
         }
     }
 

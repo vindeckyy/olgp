@@ -48,6 +48,7 @@ run semantic_tests scripts/check-semantic.sh
 run venus scripts/check-venus.sh
 run quickstart_script bash -n scripts/quickstart.sh
 run kernel scripts/check-kernel.sh
+run bench_models scripts/bench-models.sh
 
 if [[ "${OLGP_E2E:-0}" == "1" ]]; then
   run rtt scripts/bench-rtt.sh

@@ -1,0 +1,4 @@
+model,engine,context,batch,min_vram_mib
+qwen25-0p5,llama.cpp,4096,512,1536
+qwen25-1p5,llama.cpp,4096,512,2048
+qwen15-moe-a2p7,inferssd,4096,256,512

@@ -1,6 +1,6 @@
 # v1 route contract
 
-Fifteen routes are defined in v1. `scripts/check-contract.sh` verifies that
+Nineteen routes are defined in v1. `scripts/check-contract.sh` verifies that
 this list matches `crates/olgp-control/src/api.rs` and `proto/olgp/v1/*.proto`.
 
 | Method | Path | Auth |
@@ -20,6 +20,10 @@ this list matches `crates/olgp-control/src/api.rs` and `proto/olgp/v1/*.proto`.
 | WS | `/v1/realtime?mode=voice\|chat` | Device Token |
 | POST | `/api/chat` | Device Token |
 | POST | `/api/generate` | Device Token |
+| GET | `/v1/timers` | Device Token |
+| POST | `/v1/timers` | Device Token |
+| GET | `/v1/memos` | Device Token |
+| POST | `/v1/memos` | Device Token |
 
 Voice events: `ready`, `text_input`, `commit`, `cancel`, `reset`,
 `input_committed`, `stt_partial`, `stt_final`, `text_tentative`, `text`, `end`,
