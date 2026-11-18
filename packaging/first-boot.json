@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "device_name": "OLGP Box",
+  "services": {
+    "api": 8787,
+    "rpc": 8843,
+    "engine": 8080,
+    "lupine": 14833
+  },
+  "paths": {
+    "config": "/etc/olgp/node.toml",
+    "tls_cert": "/etc/olgp/tls/cert.pem",
+    "tls_key": "/etc/olgp/tls/key.pem",
+    "spki": "/etc/olgp/spki.sha256",
+    "household": "/var/lib/olgp/household.json",
+    "audio_memory": "/var/lib/olgp/audio-memory.json",
+    "pairing_code": "/var/lib/olgp/pairing.code"
+  },
+  "pairing": {
+    "first_window_seconds": 900,
+    "invite_window_seconds": 300,
+    "max_attempts": 5
+  },
+  "discovery": {
+    "service_type": "_olgp._tcp.local.",
+    "txt_keys": ["v", "id", "fp", "api", "rpc", "caps", "gpu", "vram_mib", "box"]
+  }
+}

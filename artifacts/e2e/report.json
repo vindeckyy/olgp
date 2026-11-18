@@ -47,6 +47,10 @@
     "status": "passed",
     "detail": "log:/tmp/olgp-api_compat.log"
   },
+  "packaging": {
+    "status": "passed",
+    "detail": "log:/tmp/olgp-packaging.log"
+  },
   "rtt": {
     "status": "skipped",
     "detail": "hardware run not requested; set OLGP_E2E=1 on the paired machines"

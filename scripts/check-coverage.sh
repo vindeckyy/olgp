@@ -30,6 +30,7 @@ keep = {
     "crates/olgp-control/src/registry.rs",
     "crates/olgp-driver/src/lib.rs",
     "crates/olgp-control/src/memory.rs",
+    "crates/olgp-control/src/netlink.rs",
 }
 found = covered = 0
 current = None

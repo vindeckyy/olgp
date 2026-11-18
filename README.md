@@ -21,6 +21,8 @@ shim path remains separate.
 - `third_party/` — pinned Apache-2.0/MIT OR Apache-2.0 dependencies.
 - `sdk/swift/` — Swift HTTP client.
 - `sdk/python/olgp/torch_support.py` — `olgp.gpu(...)` device-like helper.
+- `sdk/csharp/` — C# HTTP client.
+- `crates/olgp-control/src/netlink.rs` — measured multi-link selection.
 
 ## Quickstart
 
@@ -40,6 +42,7 @@ python3 -m unittest discover -s tests/unit -v
 scripts/check-contract.sh
 scripts/check-lupine-patches.sh
 scripts/check-semantic.sh
+scripts/check-api-compat.sh
 scripts/check-coverage.sh
 scripts/run-all.sh
 ```

@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod household;
 pub mod pairing;
 pub mod sched;
+pub mod netlink;
 pub mod registry;
 pub mod memory;
 pub mod telemetry;
