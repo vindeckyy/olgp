@@ -1,8 +1,10 @@
+import os
 import pathlib
+import struct
 import sys
-import unittest
-
 import types
+import tempfile
+import unittest
 from unittest import mock
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "engine/olgp-engine/src"))
@@ -31,6 +33,7 @@ class AsrTest(unittest.TestCase):
 
             def accept_waveform(self, rate: int, samples: list[int]) -> None:
                 self.rate = rate
+                self.samples = samples
 
         class FakeRecognizer:
             def create_stream(self) -> FakeStream:
@@ -44,10 +47,26 @@ class AsrTest(unittest.TestCase):
                 from_whisper=lambda **kwargs: FakeRecognizer()
             )
         )
-        with mock.patch.dict(sys.modules, {"sherpa_onnx": fake}):
-            factory = asr.sherpa_backend_factory()
+        with tempfile.TemporaryDirectory() as root:
+            paths = [pathlib.Path(root) / name for name in ("encoder", "decoder", "tokens")]
+            for path in paths:
+                path.write_bytes(b"model")
+            env = {
+                "OLGP_ASR_ENCODER": str(paths[0]),
+                "OLGP_ASR_DECODER": str(paths[1]),
+                "OLGP_ASR_TOKENS": str(paths[2]),
+            }
+            with mock.patch.dict(os.environ, env), mock.patch.dict(sys.modules, {"sherpa_onnx": fake}):
+                factory = asr.sherpa_backend_factory()
         self.assertIsNotNone(factory)
-        self.assertEqual(factory(b"abc"), "hello")
+        self.assertEqual(factory(b"abc\x00"), "hello")
+
+    def test_full_duplex_barge_in(self) -> None:
+        controller = asr.FullDuplexController(threshold=100, min_frames=2)
+        controller.begin_tts()
+        self.assertFalse(controller.observe_user_pcm(struct.pack("<hh", 1000, 1000)).cancelled)
+        self.assertTrue(controller.observe_user_pcm(struct.pack("<hh", 1000, 1000)).cancelled)
+        self.assertFalse(controller.speaking)
 
     def test_sherpa_factory_is_optional(self) -> None:
         self.assertTrue(callable(asr.sherpa_backend_factory()) or asr.sherpa_backend_factory() is None)

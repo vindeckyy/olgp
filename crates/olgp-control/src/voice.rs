@@ -28,6 +28,21 @@ pub fn should_speak(input: GateInput) -> bool {
             && input.position >= 35)
 }
 
+fn pcm_energy(frame: &[u8]) -> u64 {
+    let samples = &frame[1..];
+    if samples.is_empty() {
+        return 0;
+    }
+    let sum: u64 = samples
+        .iter()
+        .map(|byte| {
+            let sample = i64::from(*byte) - 128;
+            (sample * sample) as u64
+        })
+        .sum();
+    sum / samples.len() as u64
+}
+
 /// One voice session state.
 #[derive(Debug, Default)]
 pub struct VoiceSession {
@@ -78,6 +93,8 @@ pub async fn serve(socket: TcpStream) -> Result<(), String> {
     });
     stream.send(text_frame(ready)).await.map_err(|e| e.to_string())?;
     let mut session = VoiceSession::default();
+    let mut speaking = false;
+    let mut loud_frames = 0u32;
     while let Some(message) = stream.next().await {
         let message = message.map_err(|e| e.to_string())?;
         match message {
@@ -120,6 +137,7 @@ pub async fn serve(socket: TcpStream) -> Result<(), String> {
                                 .send(text_frame(json!({"type":"end"})))
                                 .await
                                 .map_err(|e| e.to_string())?;
+                            speaking = true;
                         }
                     }
                     "cancel" | "reset" => {
@@ -134,6 +152,26 @@ pub async fn serve(socket: TcpStream) -> Result<(), String> {
             }
             Message::Binary(frame) if frame.first() == Some(&0x01) => {
                 let _ = trace_event("audio_pcm");
+                if speaking {
+                    if pcm_energy(&frame) > 10_000 {
+                        loud_frames += 1;
+                    } else {
+                        loud_frames = 0;
+                    }
+                    if loud_frames >= 2 {
+                        speaking = false;
+                        loud_frames = 0;
+                        session = VoiceSession::default();
+                        stream
+                            .send(text_frame(json!({"type":"cancel","reason":"barge_in"})))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        stream
+                            .send(text_frame(json!({"type":"input_committed"})))
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
             }
             Message::Close(_) => break,
             _ => {}
@@ -311,6 +349,42 @@ mod tests {
         client.send(Message::Text(json!({"type":"cancel"}).to_string().into())).await.unwrap();
         let end = client.next().await.unwrap().unwrap().into_text().unwrap();
         assert!(end.contains("\"type\":\"end\""));
+        client.close(None).await.unwrap();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn websocket_detects_barge_in_during_speech() {
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_tungstenite::client_async;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            serve(socket).await.unwrap();
+        });
+        let stream = TcpStream::connect(address).await.unwrap();
+        let (mut client, _) = client_async("ws://127.0.0.1/realtime", stream).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("ready"));
+
+        client
+            .send(Message::Text(json!({"type":"text_tentative","text":"answer"}).to_string().into()))
+            .await
+            .unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("text_tentative"));
+        client.send(Message::Text(json!({"type":"commit"}).to_string().into())).await.unwrap();
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"text\""));
+        assert!(client.next().await.unwrap().unwrap().into_text().unwrap().contains("\"type\":\"end\""));
+
+        let loud = vec![0x01, 0xff, 0xff, 0xff, 0xff];
+        client.send(Message::Binary(loud.clone().into())).await.unwrap();
+        client.send(Message::Binary(loud.into())).await.unwrap();
+        let cancel = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(cancel.contains("barge_in"));
+        let committed = client.next().await.unwrap().unwrap().into_text().unwrap();
+        assert!(committed.contains("input_committed"));
+
         client.close(None).await.unwrap();
         let _ = server.await;
     }
